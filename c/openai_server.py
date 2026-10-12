@@ -5305,6 +5305,8 @@ class Engine:
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
+        self.prompt_tokens_total = 0       # cumulative prompt (prefill) tokens
+        self.completion_tokens_total = 0   # cumulative completion (decode) tokens
         self.caps = {}                         # the engine's CAPS handshake line, key=value
         # What the engine wrote before READY, the last 4 KiB of it: an engine that
         # exits instead of saying READY leaves its LOAD_FAIL line there.
@@ -5348,6 +5350,19 @@ class Engine:
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
         }
+
+    def tokens_prometheus(self):
+        """Token throughput counters. The scheduler's own prometheus() covers
+        queue/occupancy/timing; this adds prefill and decode tokens so dashboards
+        can plot rate() as tokens/s."""
+        return (
+            "# HELP colibri_prompt_tokens_total Prompt tokens pre-filled (input).\n"
+            "# TYPE colibri_prompt_tokens_total counter\n"
+            f"colibri_prompt_tokens_total {self.prompt_tokens_total}\n"
+            "# HELP colibri_completion_tokens_total Completion tokens generated (output).\n"
+            "# TYPE colibri_completion_tokens_total counter\n"
+            f"colibri_completion_tokens_total {self.completion_tokens_total}\n"
+        )
 
     def _fail_pending(self, error):
         with self.pending_lock:
@@ -5584,6 +5599,8 @@ class Engine:
                 elif kind == "DONE" and len(fields) >= 7:
                     request_id = fields[1]
                     stats = self._stats(fields[2:])
+                    self.prompt_tokens_total += stats["prompt_tokens"]
+                    self.completion_tokens_total += stats["completion_tokens"]
                     with self.pending_lock:
                         entry = self.pending.pop(request_id, None)
                     if entry is not None:
@@ -6579,7 +6596,8 @@ class APIHandler(BaseHTTPRequestHandler):
             path = urlsplit(self.path).path
             if path == "/metrics":
                 self.require_auth()
-                data = self.server.scheduler.prometheus().encode("utf-8")
+                data = (self.server.scheduler.prometheus() +
+                        getattr(self.server.engine, "tokens_prometheus", lambda: "")()).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
