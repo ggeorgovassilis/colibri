@@ -876,6 +876,7 @@ typedef struct {
  * that turn sit past them. */
 typedef struct {
     float **K, **V, **DN_rec, **DN_conv;
+    uint8_t **K8, **V8; float **Ksc, **Vsc;   /* COLI_KV8 fp8 KV + per-row scales */
     int kv_len;
     kv_prefix kvp;
     int *mpos, mpos_len, rope_delta;
@@ -907,6 +908,11 @@ typedef struct {
     double t_disk;
     uint8_t **ehit;
     float **K, **V; int kv_len, max_t, kv_cap;
+    /* COLI_KV8: the attention K/V cache quantised to fp8 e4m3 bytes with one
+     * f32 per-row scale (K8/V8 = bytes, Ksc/Vsc = scales). NULL when off; the
+     * f32 K/V stay the canonical fallback. Indexed like K/V:
+     * (head*max_t + position)*kvd bytes, (head*max_t + position) scales. */
+    uint8_t **K8, **V8; float **Ksc, **Vsc;
     /* What the current attention and DeltaNet state was built from, so a
      * turn that resends the transcript prefills only the new tail. The ids
      * are recorded where they are fed, never derived from a counter: see
@@ -1133,6 +1139,25 @@ static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fpr
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 
+#include "kv_fp8.h"       /* fp8 e4m3 KV-cache quantisers (COLI_KV8) */
+
+/* Fused fp8 KV score dot: acc = SUM qv[j] * lut[k8[j]]. The per-row f32 scale
+ * is folded in by the caller (the score pass) or applied to the context pass.
+ * Same FMA-aware MATMUL_F32_LANES idiom as dot_f32_lanes, so the reduction
+ * order is fixed and Ivy Bridge (no FMA) stays a plain mul-add, not a libm
+ * fmaf call. Never stages a dequantised f32 row: that would discard the
+ * bandwidth win the whole scheme exists for. */
+static inline float dot_fp8(const float *q, const uint8_t *k8, int I){
+    float a[MATMUL_F32_LANES] = {0};
+    int i = 0;
+    for (; i + MATMUL_F32_LANES <= I; i += MATMUL_F32_LANES)
+        for (int j = 0; j < MATMUL_F32_LANES; j++) a[j] = MATMUL_F32_MADD(a[j], q[i+j], coli_fp8_lut[k8[i+j]]);
+    for (int j = 0; i + j < I; j++) a[j] = MATMUL_F32_MADD(a[j], q[i+j], coli_fp8_lut[k8[i+j]]);
+    for (int h = MATMUL_F32_LANES/2; h > 0; h >>= 1)
+        for (int j = 0; j < h; j++) a[j] += a[j+h];
+    return a[0];
+}
+
 /* y[1,O] = x[1,I] @ W^T with W quantized: q[O,I] int8 + scale per row.
  * matmul_q lives in qgemv.h so tests/test_qgemv.c can link the exact kernel
  * the engine runs (qwen36.c has a main() and cannot itself be linked into a
@@ -1332,6 +1357,10 @@ static void matmul_qd(float *y, const float *x, const int8_t *q, const float *sc
  * the token reads; lm_head alone goes from 508 to 254 MB. It implies the
  * integer dot (that layout has no f32 kernel). Same gate: measured. */
 static int dense_idot_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_IDOT"); v=!(e&&*e=='0'); } return v; }
+/* COLI_KV8: fp8 e4m3 KV-cache quantisation for the attention K/V cache
+ * (qwen36-kv-fp8 task). Default 0 (off) until the A/B in benchmarks/colibri
+ * passes; the reference quantisers live in kv_fp8.h. */
+static int kv8_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_KV8"); v=(e&&*e=='1'); } return v; }
 /* COLI_DENSE_BITS: 8 (default) int8 rows, 4 the int4 planar copy per
  * COLI_DENSE_INT4, 16 the container's own f16 values (no quantization: twice
  * the RAM of int8, the precision the checkpoint was converted at). */
@@ -3048,6 +3077,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     }
     const Q36Row *mr = m->mux_rows;   /* a multiplexed step: each row's own conversation and position */
+    const int kv8 = kv8_on();         /* fp8 KV cache this step (per-row storage presence gated below) */
     for (int s = 0; s < S; s++) {
         int pos = mr ? mr[s].pos : pos_base + s;
         /* the rope of the row's conversation: an image turn's decode rows sit at
@@ -3071,8 +3101,19 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     for (int s = 0; s < S; s++) for (int kvh = 0; kvh < KV; kvh++) {
         int t = mr ? mr[s].pos : pos_base + s;
         float *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
-        memcpy(Kl + ((int64_t)kvh*m->max_t + t)*kvd, k + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
-        memcpy(Vl + ((int64_t)kvh*m->max_t + t)*kvd, vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
+        const float *ks = k + (int64_t)s*KV*kvd + kvh*kvd, *vs = vv + (int64_t)s*KV*kvd + kvh*kvd;
+        uint8_t *K8l = kv8 ? (mr ? mr[s].seq->K8[layer] : m->K8[layer]) : NULL;
+        uint8_t *V8l = kv8 ? (mr ? mr[s].seq->V8[layer] : m->V8[layer]) : NULL;
+        float *Kscl = kv8 ? (mr ? mr[s].seq->Ksc[layer] : m->Ksc[layer]) : NULL;
+        float *Vscl = kv8 ? (mr ? mr[s].seq->Vsc[layer] : m->Vsc[layer]) : NULL;
+        if (K8l && V8l && Kscl && Vscl) {
+            /* encode the rope'd K row and the raw V row to fp8, one f32 scale each */
+            Kscl[(int64_t)kvh*m->max_t + t] = coli_kv8_quant_row(ks, K8l + ((int64_t)kvh*m->max_t + t)*kvd, kvd);
+            Vscl[(int64_t)kvh*m->max_t + t] = coli_kv8_quant_row(vs, V8l + ((int64_t)kvh*m->max_t + t)*kvd, kvd);
+        } else {
+            memcpy(Kl + ((int64_t)kvh*m->max_t + t)*kvd, ks, kvd*sizeof(float));
+            memcpy(Vl + ((int64_t)kvh*m->max_t + t)*kvd, vs, kvd*sizeof(float));
+        }
     }
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc((int64_t)S*H*hd);
@@ -3082,23 +3123,45 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             int kvh = hh / q_per_kv;
             int qpos = mr ? mr[s].pos : pos_base + s;
             const float *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
+            const uint8_t *K8l = kv8 ? (mr ? mr[s].seq->K8[layer] : m->K8[layer]) : NULL;
+            const uint8_t *V8l = kv8 ? (mr ? mr[s].seq->V8[layer] : m->V8[layer]) : NULL;
+            const float *Kscl = kv8 ? (mr ? mr[s].seq->Ksc[layer] : m->Ksc[layer]) : NULL;
+            const float *Vscl = kv8 ? (mr ? mr[s].seq->Vsc[layer] : m->Vsc[layer]) : NULL;
             const float *qv = query + ((int64_t)s*H + hh)*hd;
             int tid = 0;
 #ifdef _OPENMP
             tid = omp_get_thread_num();
 #endif
             float *sc = m->attn_sc + (int64_t)tid * m->kv_cap;
-            for (int t = 0; t <= qpos; t++) {
-                const float *kv = Kl + ((int64_t)kvh*m->max_t + t)*kvd;
-                float acc = dot_f32_lanes(qv, kv, kvd);
-                sc[t] = acc * scale;
-            }
-            softmax_row(sc, qpos+1);
-            float *cx = ctx + ((int64_t)s*H + hh)*hd;
-            for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
-            for (int t = 0; t <= qpos; t++) {
-                const float *vrow = Vl + ((int64_t)kvh*m->max_t + t)*kvd;
-                float a = sc[t]; for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
+            if (K8l && V8l && Kscl && Vscl) {
+                /* fp8: fused score dot (per-row scale folded in) then a
+                 * dequantise-on-the-fly context pass; no f32 row staging. */
+                for (int t = 0; t <= qpos; t++) {
+                    const uint8_t *kv8row = K8l + ((int64_t)kvh*m->max_t + t)*kvd;
+                    float acc = dot_fp8(qv, kv8row, kvd);
+                    sc[t] = acc * Kscl[(int64_t)kvh*m->max_t + t] * scale;
+                }
+                softmax_row(sc, qpos+1);
+                float *cx = ctx + ((int64_t)s*H + hh)*hd;
+                for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
+                for (int t = 0; t <= qpos; t++) {
+                    const uint8_t *v8row = V8l + ((int64_t)kvh*m->max_t + t)*kvd;
+                    float as = sc[t] * Vscl[(int64_t)kvh*m->max_t + t];
+                    for (int dd = 0; dd < kvd; dd++) cx[dd] += as * coli_fp8_lut[v8row[dd]];
+                }
+            } else {
+                for (int t = 0; t <= qpos; t++) {
+                    const float *kv = Kl + ((int64_t)kvh*m->max_t + t)*kvd;
+                    float acc = dot_f32_lanes(qv, kv, kvd);
+                    sc[t] = acc * scale;
+                }
+                softmax_row(sc, qpos+1);
+                float *cx = ctx + ((int64_t)s*H + hh)*hd;
+                for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
+                for (int t = 0; t <= qpos; t++) {
+                    const float *vrow = Vl + ((int64_t)kvh*m->max_t + t)*kvd;
+                    float a = sc[t]; for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
+                }
             }
         }
     }
@@ -4357,6 +4420,8 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
 static void q36_seq_swap(Model *m, Q36Seq *q) {
 #define Q36_SEQ_SWAP(T,a,b) do { T t_ = (a); (a) = (b); (b) = t_; } while (0)
     Q36_SEQ_SWAP(float **, m->K, q->K); Q36_SEQ_SWAP(float **, m->V, q->V);
+    Q36_SEQ_SWAP(uint8_t **, m->K8, q->K8); Q36_SEQ_SWAP(uint8_t **, m->V8, q->V8);
+    Q36_SEQ_SWAP(float **, m->Ksc, q->Ksc); Q36_SEQ_SWAP(float **, m->Vsc, q->Vsc);
     Q36_SEQ_SWAP(float **, m->DN_rec, q->DN_rec); Q36_SEQ_SWAP(float **, m->DN_conv, q->DN_conv);
     Q36_SEQ_SWAP(int, m->kv_len, q->kv_len); Q36_SEQ_SWAP(kv_prefix, m->kvp, q->kvp);
     Q36_SEQ_SWAP(int *, m->mpos, q->mpos); Q36_SEQ_SWAP(int, m->mpos_len, q->mpos_len);
@@ -4369,9 +4434,12 @@ static void q36_seq_swap(Model *m, Q36Seq *q) {
 static void q36_seq_free(Model *m, Q36Seq *q) {
     for (int i = 0; i < m->c.n_layers; i++) {
         if (q->K) free(q->K[i]); if (q->V) free(q->V[i]);
+        if (q->K8) free(q->K8[i]); if (q->V8) free(q->V8[i]);
+        if (q->Ksc) free(q->Ksc[i]); if (q->Vsc) free(q->Vsc[i]);
         if (q->DN_rec) free(q->DN_rec[i]); if (q->DN_conv) free(q->DN_conv[i]);
     }
-    free(q->K); free(q->V); free(q->DN_rec); free(q->DN_conv);
+    free(q->K); free(q->V); free(q->K8); free(q->V8); free(q->Ksc); free(q->Vsc);
+    free(q->DN_rec); free(q->DN_conv);
     kv_prefix_free(&q->kvp); free(q->mpos);
     memset(q, 0, sizeof *q);
 }
@@ -4379,13 +4447,22 @@ static int q36_seq_alloc(Model *m, Q36Seq *q) {
     Cfg *c = &m->c; memset(q, 0, sizeof *q);
     int n = c->n_layers;
     q->K = calloc((size_t)n, sizeof(float *)); q->V = calloc((size_t)n, sizeof(float *));
+    q->K8 = calloc((size_t)n, sizeof(uint8_t *)); q->V8 = calloc((size_t)n, sizeof(uint8_t *));
+    q->Ksc = calloc((size_t)n, sizeof(float *)); q->Vsc = calloc((size_t)n, sizeof(float *));
     q->DN_rec = calloc((size_t)n, sizeof(float *)); q->DN_conv = calloc((size_t)n, sizeof(float *));
     int ok = q->K && q->V && q->DN_rec && q->DN_conv && kv_prefix_alloc(&q->kvp, m->kv_cap);
+    int kv8 = kv8_on();
     for (int i = 0; ok && i < n; i++) {
         if (c->is_attn[i]) {
             size_t kv = (size_t)c->kv_heads * m->kv_cap * c->k_head_dim;
             q->K[i] = malloc(kv * sizeof(float)); q->V[i] = malloc(kv * sizeof(float));
             ok = q->K[i] && q->V[i];
+            if (ok && kv8) {
+                size_t rows = (size_t)c->kv_heads * m->kv_cap;
+                q->K8[i] = malloc(kv); q->V8[i] = malloc(kv);          /* kv bytes of uint8 */
+                q->Ksc[i] = malloc(rows * sizeof(float)); q->Vsc[i] = malloc(rows * sizeof(float));
+                ok = q->K8[i] && q->V8[i] && q->Ksc[i] && q->Vsc[i];
+            }
         } else if (m->DN_rec[i]) {
             q->DN_rec[i] = calloc((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, sizeof(float));
             q->DN_conv[i] = calloc((size_t)c->dn_conv_dim * (c->dn_convk - 1), sizeof(float));
@@ -4697,28 +4774,53 @@ static void ensure_kv(Model *m){
      * wrong offset, and that reads as a plausible answer from another
      * conversation rather than as a crash. */
     float **oldK = m->K, **oldV = m->V;
+    uint8_t **oldK8 = m->K8, **oldV8 = m->V8;
+    float **oldKsc = m->Ksc, **oldVsc = m->Vsc;
     int old_stride = m->kv_cap, keep = m->K ? m->kvp.len : 0;
     if (keep > old_stride) keep = old_stride;
     if (keep > m->max_t)   keep = m->max_t;
+    int kv8 = kv8_on();
     m->K = calloc((size_t)c->n_layers, sizeof(float*)); m->V = calloc((size_t)c->n_layers, sizeof(float*));
+    m->K8 = kv8 ? calloc((size_t)c->n_layers, sizeof(uint8_t*)) : NULL; m->V8 = kv8 ? calloc((size_t)c->n_layers, sizeof(uint8_t*)) : NULL;
+    m->Ksc = kv8 ? calloc((size_t)c->n_layers, sizeof(float*)) : NULL; m->Vsc = kv8 ? calloc((size_t)c->n_layers, sizeof(float*)) : NULL;
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]){
             int64_t kvd = c->k_head_dim;
+            int64_t rows = (int64_t)c->kv_heads * m->max_t;
             m->K[i] = falloc((int64_t)c->kv_heads * m->max_t * kvd);
             m->V[i] = falloc((int64_t)c->kv_heads * m->max_t * kvd);
+            if (kv8) {
+                m->K8[i] = malloc((size_t)((int64_t)c->kv_heads * m->max_t * kvd));
+                m->V8[i] = malloc((size_t)((int64_t)c->kv_heads * m->max_t * kvd));
+                m->Ksc[i] = malloc((size_t)rows * sizeof(float));
+                m->Vsc[i] = malloc((size_t)rows * sizeof(float));
+                if (!m->K8[i] || !m->V8[i] || !m->Ksc[i] || !m->Vsc[i]) { fprintf(stderr,"OOM kv8\n"); exit(1); }
+            }
             if (keep > 0 && oldK && oldK[i] && oldV[i])
                 for (int h = 0; h < c->kv_heads; h++){
                     memcpy(m->K[i] + (int64_t)h*m->max_t*kvd,
                            oldK[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(float));
                     memcpy(m->V[i] + (int64_t)h*m->max_t*kvd,
                            oldV[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(float));
+                    if (kv8 && oldK8 && oldK8[i] && oldV8[i] && oldKsc && oldKsc[i] && oldVsc && oldVsc[i]) {
+                        memcpy(m->K8[i] + (int64_t)h*m->max_t*kvd,
+                               oldK8[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd);
+                        memcpy(m->V8[i] + (int64_t)h*m->max_t*kvd,
+                               oldV8[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd);
+                        memcpy(m->Ksc[i] + (int64_t)h*m->max_t,
+                               oldKsc[i] + (int64_t)h*old_stride, (size_t)keep*sizeof(float));
+                        memcpy(m->Vsc[i] + (int64_t)h*m->max_t,
+                               oldVsc[i] + (int64_t)h*old_stride, (size_t)keep*sizeof(float));
+                    }
                 }
-        } else { m->K[i] = NULL; m->V[i] = NULL; }
+        } else { m->K[i] = NULL; m->V[i] = NULL; if (m->K8) m->K8[i] = NULL; if (m->V8) m->V8[i] = NULL; if (m->Ksc) m->Ksc[i] = NULL; if (m->Vsc) m->Vsc[i] = NULL; }
     }
     if (oldK){
         for (int i = 0; i < c->n_layers; i++){ if (oldK[i]) free(oldK[i]); if (oldV[i]) free(oldV[i]); }
         free(oldK); free(oldV);
     }
+    if (oldK8){ for (int i = 0; i < c->n_layers; i++){ if (oldK8[i]) free(oldK8[i]); if (oldV8[i]) free(oldV8[i]); } free(oldK8); free(oldV8); }
+    if (oldKsc){ for (int i = 0; i < c->n_layers; i++){ if (oldKsc[i]) free(oldKsc[i]); if (oldVsc[i]) free(oldVsc[i]); } free(oldKsc); free(oldVsc); }
     /* Attention scores: one row per thread, indexed by absolute position, so
      * each row must hold max_t entries. Sized here rather than in attention()
      * because it grows with the context exactly like the KV cache does, and
@@ -6221,6 +6323,7 @@ int main(int argc, char **argv) {
      * per-expert region (#718 measured +2.3x from the sizing alone on a
      * 16C/32T part). OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. */
     coli_omp_tune_threads("qwen36");
+    coli_fp8_lut_init();          /* idempotent; must run before the first token (COLI_KV8) */
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
