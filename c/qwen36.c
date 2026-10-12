@@ -4455,13 +4455,15 @@ static int q36_seq_alloc(Model *m, Q36Seq *q) {
     for (int i = 0; ok && i < n; i++) {
         if (c->is_attn[i]) {
             size_t kv = (size_t)c->kv_heads * m->kv_cap * c->k_head_dim;
-            q->K[i] = malloc(kv * sizeof(float)); q->V[i] = malloc(kv * sizeof(float));
-            ok = q->K[i] && q->V[i];
-            if (ok && kv8) {
-                size_t rows = (size_t)c->kv_heads * m->kv_cap;
+            size_t rows = (size_t)c->kv_heads * m->kv_cap;
+            if (kv8) {
+                q->K[i] = NULL; q->V[i] = NULL;
                 q->K8[i] = malloc(kv); q->V8[i] = malloc(kv);          /* kv bytes of uint8 */
                 q->Ksc[i] = malloc(rows * sizeof(float)); q->Vsc[i] = malloc(rows * sizeof(float));
                 ok = q->K8[i] && q->V8[i] && q->Ksc[i] && q->Vsc[i];
+            } else {
+                q->K[i] = malloc(kv * sizeof(float)); q->V[i] = malloc(kv * sizeof(float));
+                ok = q->K[i] && q->V[i];
             }
         } else if (m->DN_rec[i]) {
             q->DN_rec[i] = calloc((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, sizeof(float));
@@ -4787,21 +4789,27 @@ static void ensure_kv(Model *m){
         if (c->is_attn[i]){
             int64_t kvd = c->k_head_dim;
             int64_t rows = (int64_t)c->kv_heads * m->max_t;
-            m->K[i] = falloc((int64_t)c->kv_heads * m->max_t * kvd);
-            m->V[i] = falloc((int64_t)c->kv_heads * m->max_t * kvd);
             if (kv8) {
+                /* fp8: the f32 K/V are never staged — only the quantised bytes
+                 * and per-row scales exist, so the cache actually shrinks ~4x. */
+                m->K[i] = NULL; m->V[i] = NULL;
                 m->K8[i] = malloc((size_t)((int64_t)c->kv_heads * m->max_t * kvd));
                 m->V8[i] = malloc((size_t)((int64_t)c->kv_heads * m->max_t * kvd));
                 m->Ksc[i] = malloc((size_t)rows * sizeof(float));
                 m->Vsc[i] = malloc((size_t)rows * sizeof(float));
                 if (!m->K8[i] || !m->V8[i] || !m->Ksc[i] || !m->Vsc[i]) { fprintf(stderr,"OOM kv8\n"); exit(1); }
+            } else {
+                m->K[i] = falloc((int64_t)c->kv_heads * m->max_t * kvd);
+                m->V[i] = falloc((int64_t)c->kv_heads * m->max_t * kvd);
             }
-            if (keep > 0 && oldK && oldK[i] && oldV[i])
+            if (keep > 0)
                 for (int h = 0; h < c->kv_heads; h++){
-                    memcpy(m->K[i] + (int64_t)h*m->max_t*kvd,
-                           oldK[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(float));
-                    memcpy(m->V[i] + (int64_t)h*m->max_t*kvd,
-                           oldV[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(float));
+                    if (oldK && oldK[i] && oldV[i]) {
+                        memcpy(m->K[i] + (int64_t)h*m->max_t*kvd,
+                               oldK[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(float));
+                        memcpy(m->V[i] + (int64_t)h*m->max_t*kvd,
+                               oldV[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(float));
+                    }
                     if (kv8 && oldK8 && oldK8[i] && oldV8[i] && oldKsc && oldKsc[i] && oldVsc && oldVsc[i]) {
                         memcpy(m->K8[i] + (int64_t)h*m->max_t*kvd,
                                oldK8[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd);
