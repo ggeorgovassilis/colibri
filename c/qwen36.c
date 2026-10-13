@@ -877,6 +877,7 @@ typedef struct {
 typedef struct {
     float **K, **V, **DN_rec, **DN_conv;
     uint8_t **K8, **V8; float **Ksc, **Vsc;   /* COLI_KV8 fp8 KV + per-row scales */
+    uint16_t **K16, **V16;                    /* COLI_KV16 fp16 KV (no scales) */
     int kv_len;
     kv_prefix kvp;
     int *mpos, mpos_len, rope_delta;
@@ -913,6 +914,10 @@ typedef struct {
      * f32 K/V stay the canonical fallback. Indexed like K/V:
      * (head*max_t + position)*kvd bytes, (head*max_t + position) scales. */
     uint8_t **K8, **V8; float **Ksc, **Vsc;
+    /* COLI_KV16: the attention K/V cache as fp16 (2 bytes/element), no per-row
+     * scale. Mutually exclusive with K8/V8 (kv16 wins when both are on). NULL
+     * when off; the f32 K/V stay the canonical fallback. Indexed like K/V. */
+    uint16_t **K16, **V16;
     /* What the current attention and DeltaNet state was built from, so a
      * turn that resends the transcript prefills only the new tail. The ids
      * are recorded where they are fed, never derived from a counter: see
@@ -1140,6 +1145,7 @@ static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fpr
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 
 #include "kv_fp8.h"       /* fp8 e4m3 KV-cache quantisers (COLI_KV8) */
+#include "kv_fp16.h"      /* fp16 KV-cache encode/decode + fused dots (COLI_KV16) */
 
 /* Fused fp8 KV score dot: acc = SUM qv[j] * lut[k8[j]]. The per-row f32 scale
  * is folded in by the caller (the score pass) or applied to the context pass.
@@ -1361,6 +1367,11 @@ static int dense_idot_on(void){ static int v=-1; if(v<0){ const char *e=getenv("
  * (qwen36-kv-fp8 task). Default 0 (off) until the A/B in benchmarks/colibri
  * passes; the reference quantisers live in kv_fp8.h. */
 static int kv8_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_KV8"); v=(e&&*e=='1'); } return v; }
+/* COLI_KV16: fp16 KV-cache for the attention K/V cache (qwen36-kv-fp8 task,
+ * Phase 3). Default 0 (off). Wins over COLI_KV8 when both are set: fp16 has no
+ * per-row scale and the F16C decode is a single instruction, so there is no
+ * fp8-style dequant tax on Ivy Bridge. */
+static int kv16_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_KV16"); v=(e&&*e=='1'); } return v; }
 /* COLI_DENSE_BITS: 8 (default) int8 rows, 4 the int4 planar copy per
  * COLI_DENSE_INT4, 16 the container's own f16 values (no quantization: twice
  * the RAM of int8, the precision the checkpoint was converted at). */
@@ -3078,6 +3089,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     }
     const Q36Row *mr = m->mux_rows;   /* a multiplexed step: each row's own conversation and position */
     const int kv8 = kv8_on();         /* fp8 KV cache this step (per-row storage presence gated below) */
+    const int kv16 = kv16_on();       /* fp16 KV cache this step (wins over kv8 when both on) */
     for (int s = 0; s < S; s++) {
         int pos = mr ? mr[s].pos : pos_base + s;
         /* the rope of the row's conversation: an image turn's decode rows sit at
@@ -3106,7 +3118,13 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         uint8_t *V8l = kv8 ? (mr ? mr[s].seq->V8[layer] : m->V8[layer]) : NULL;
         float *Kscl = kv8 ? (mr ? mr[s].seq->Ksc[layer] : m->Ksc[layer]) : NULL;
         float *Vscl = kv8 ? (mr ? mr[s].seq->Vsc[layer] : m->Vsc[layer]) : NULL;
-        if (K8l && V8l && Kscl && Vscl) {
+        uint16_t *K16l = kv16 ? (mr ? mr[s].seq->K16[layer] : m->K16[layer]) : NULL;
+        uint16_t *V16l = kv16 ? (mr ? mr[s].seq->V16[layer] : m->V16[layer]) : NULL;
+        if (K16l && V16l) {
+            /* encode the rope'd K row and the raw V row to fp16 (RNE, F16C). */
+            coli_f32_to_f16_bulk(ks, K16l + ((int64_t)kvh*m->max_t + t)*kvd, kvd);
+            coli_f32_to_f16_bulk(vs, V16l + ((int64_t)kvh*m->max_t + t)*kvd, kvd);
+        } else if (K8l && V8l && Kscl && Vscl) {
             /* encode the rope'd K row and the raw V row to fp8, one f32 scale each */
             Kscl[(int64_t)kvh*m->max_t + t] = coli_kv8_quant_row(ks, K8l + ((int64_t)kvh*m->max_t + t)*kvd, kvd);
             Vscl[(int64_t)kvh*m->max_t + t] = coli_kv8_quant_row(vs, V8l + ((int64_t)kvh*m->max_t + t)*kvd, kvd);
@@ -3117,7 +3135,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     }
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc((int64_t)S*H*hd);
-    if (S == 1 && !kv8 && m->attn_sc_thr >= H) {
+    if (S == 1 && !kv8 && !kv16 && m->attn_sc_thr >= H) {
         /* GQA decode read-once (f32 KV): each kvh's K cache is streamed exactly
          * once instead of once per query head in its group. The score pass is
          * parallel over (kvh, t) and stages one score row per head into attn_sc
@@ -3152,6 +3170,39 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
                     for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
                 }
             }
+    } else if (S == 1 && kv16 && m->attn_sc_thr >= H) {
+        /* GQA decode read-once (fp16 KV): same streaming shape as the f32 fast
+         * path, but the fp16 row is decoded inside the fused dot (coli_dot_fp16)
+         * and accumulated inside coli_f16_madd -- no f32 row staging, so the 2x
+         * cache-footprint win is kept. Not bit-exact vs f32 (see kv_fp16.h). */
+        int qpos = mr ? mr[0].pos : pos_base;
+        const uint16_t *K16l = mr ? mr[0].seq->K16[layer] : m->K16[layer];
+        const uint16_t *V16l = mr ? mr[0].seq->V16[layer] : m->V16[layer];
+        float *sc = m->attn_sc;                 /* [H * kv_cap] grouped rows */
+        const int64_t cap = m->kv_cap;
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int kvh = 0; kvh < KV; kvh++)
+            for (int t = 0; t <= qpos; t++) {
+                const uint16_t *krow = K16l + ((int64_t)kvh*m->max_t + t)*kvd;
+                for (int g = 0; g < q_per_kv; g++) {
+                    int hh = kvh*q_per_kv + g;
+                    sc[(int64_t)hh*cap + t] =
+                        coli_dot_fp16(query + (int64_t)hh*hd, krow, kvd) * scale;
+                }
+            }
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int kvh = 0; kvh < KV; kvh++)
+            for (int g = 0; g < q_per_kv; g++) {
+                int hh = kvh*q_per_kv + g;
+                float *row = sc + (int64_t)hh*cap;
+                softmax_row(row, qpos + 1);
+                float *cx = ctx + (int64_t)hh*hd;
+                for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
+                for (int t = 0; t <= qpos; t++) {
+                    const uint16_t *vrow = V16l + ((int64_t)kvh*m->max_t + t)*kvd;
+                    coli_f16_madd(cx, vrow, row[t], kvd);
+                }
+            }
     } else {
         #pragma omp parallel for collapse(2) schedule(static)
         for (int hh = 0; hh < H; hh++) {
@@ -3163,13 +3214,28 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             const uint8_t *V8l = kv8 ? (mr ? mr[s].seq->V8[layer] : m->V8[layer]) : NULL;
             const float *Kscl = kv8 ? (mr ? mr[s].seq->Ksc[layer] : m->Ksc[layer]) : NULL;
             const float *Vscl = kv8 ? (mr ? mr[s].seq->Vsc[layer] : m->Vsc[layer]) : NULL;
+            const uint16_t *K16l = kv16 ? (mr ? mr[s].seq->K16[layer] : m->K16[layer]) : NULL;
+            const uint16_t *V16l = kv16 ? (mr ? mr[s].seq->V16[layer] : m->V16[layer]) : NULL;
             const float *qv = query + ((int64_t)s*H + hh)*hd;
             int tid = 0;
 #ifdef _OPENMP
             tid = omp_get_thread_num();
 #endif
             float *sc = m->attn_sc + (int64_t)tid * m->kv_cap;
-            if (K8l && V8l && Kscl && Vscl) {
+            if (K16l && V16l) {
+                /* fp16: fused score dot + fused context accumulate, no staging. */
+                for (int t = 0; t <= qpos; t++) {
+                    const uint16_t *kv16row = K16l + ((int64_t)kvh*m->max_t + t)*kvd;
+                    sc[t] = coli_dot_fp16(qv, kv16row, kvd) * scale;
+                }
+                softmax_row(sc, qpos+1);
+                float *cx = ctx + ((int64_t)s*H + hh)*hd;
+                for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
+                for (int t = 0; t <= qpos; t++) {
+                    const uint16_t *v16row = V16l + ((int64_t)kvh*m->max_t + t)*kvd;
+                    coli_f16_madd(cx, v16row, sc[t], kvd);
+                }
+            } else if (K8l && V8l && Kscl && Vscl) {
                 /* fp8: fused score dot (per-row scale folded in) then a
                  * dequantise-on-the-fly context pass; no f32 row staging. */
                 for (int t = 0; t <= qpos; t++) {
@@ -4459,6 +4525,7 @@ static void q36_seq_swap(Model *m, Q36Seq *q) {
     Q36_SEQ_SWAP(float **, m->K, q->K); Q36_SEQ_SWAP(float **, m->V, q->V);
     Q36_SEQ_SWAP(uint8_t **, m->K8, q->K8); Q36_SEQ_SWAP(uint8_t **, m->V8, q->V8);
     Q36_SEQ_SWAP(float **, m->Ksc, q->Ksc); Q36_SEQ_SWAP(float **, m->Vsc, q->Vsc);
+    Q36_SEQ_SWAP(uint16_t **, m->K16, q->K16); Q36_SEQ_SWAP(uint16_t **, m->V16, q->V16);
     Q36_SEQ_SWAP(float **, m->DN_rec, q->DN_rec); Q36_SEQ_SWAP(float **, m->DN_conv, q->DN_conv);
     Q36_SEQ_SWAP(int, m->kv_len, q->kv_len); Q36_SEQ_SWAP(kv_prefix, m->kvp, q->kvp);
     Q36_SEQ_SWAP(int *, m->mpos, q->mpos); Q36_SEQ_SWAP(int, m->mpos_len, q->mpos_len);
@@ -4473,9 +4540,11 @@ static void q36_seq_free(Model *m, Q36Seq *q) {
         if (q->K) free(q->K[i]); if (q->V) free(q->V[i]);
         if (q->K8) free(q->K8[i]); if (q->V8) free(q->V8[i]);
         if (q->Ksc) free(q->Ksc[i]); if (q->Vsc) free(q->Vsc[i]);
+        if (q->K16) free(q->K16[i]); if (q->V16) free(q->V16[i]);
         if (q->DN_rec) free(q->DN_rec[i]); if (q->DN_conv) free(q->DN_conv[i]);
     }
     free(q->K); free(q->V); free(q->K8); free(q->V8); free(q->Ksc); free(q->Vsc);
+    free(q->K16); free(q->V16);
     free(q->DN_rec); free(q->DN_conv);
     kv_prefix_free(&q->kvp); free(q->mpos);
     memset(q, 0, sizeof *q);
@@ -4486,14 +4555,19 @@ static int q36_seq_alloc(Model *m, Q36Seq *q) {
     q->K = calloc((size_t)n, sizeof(float *)); q->V = calloc((size_t)n, sizeof(float *));
     q->K8 = calloc((size_t)n, sizeof(uint8_t *)); q->V8 = calloc((size_t)n, sizeof(uint8_t *));
     q->Ksc = calloc((size_t)n, sizeof(float *)); q->Vsc = calloc((size_t)n, sizeof(float *));
+    q->K16 = calloc((size_t)n, sizeof(uint16_t *)); q->V16 = calloc((size_t)n, sizeof(uint16_t *));
     q->DN_rec = calloc((size_t)n, sizeof(float *)); q->DN_conv = calloc((size_t)n, sizeof(float *));
     int ok = q->K && q->V && q->DN_rec && q->DN_conv && kv_prefix_alloc(&q->kvp, m->kv_cap);
-    int kv8 = kv8_on();
+    int kv8 = kv8_on(), kv16 = kv16_on();
     for (int i = 0; ok && i < n; i++) {
         if (c->is_attn[i]) {
             size_t kv = (size_t)c->kv_heads * m->kv_cap * c->k_head_dim;
             size_t rows = (size_t)c->kv_heads * m->kv_cap;
-            if (kv8) {
+            if (kv16) {
+                q->K[i] = NULL; q->V[i] = NULL;
+                q->K16[i] = malloc(kv * sizeof(uint16_t)); q->V16[i] = malloc(kv * sizeof(uint16_t));
+                ok = q->K16[i] && q->V16[i];
+            } else if (kv8) {
                 q->K[i] = NULL; q->V[i] = NULL;
                 q->K8[i] = malloc(kv); q->V8[i] = malloc(kv);          /* kv bytes of uint8 */
                 q->Ksc[i] = malloc(rows * sizeof(float)); q->Vsc[i] = malloc(rows * sizeof(float));
@@ -4815,18 +4889,26 @@ static void ensure_kv(Model *m){
     float **oldK = m->K, **oldV = m->V;
     uint8_t **oldK8 = m->K8, **oldV8 = m->V8;
     float **oldKsc = m->Ksc, **oldVsc = m->Vsc;
+    uint16_t **oldK16 = m->K16, **oldV16 = m->V16;
     int old_stride = m->kv_cap, keep = m->K ? m->kvp.len : 0;
     if (keep > old_stride) keep = old_stride;
     if (keep > m->max_t)   keep = m->max_t;
-    int kv8 = kv8_on();
+    int kv8 = kv8_on(), kv16 = kv16_on();
     m->K = calloc((size_t)c->n_layers, sizeof(float*)); m->V = calloc((size_t)c->n_layers, sizeof(float*));
     m->K8 = kv8 ? calloc((size_t)c->n_layers, sizeof(uint8_t*)) : NULL; m->V8 = kv8 ? calloc((size_t)c->n_layers, sizeof(uint8_t*)) : NULL;
     m->Ksc = kv8 ? calloc((size_t)c->n_layers, sizeof(float*)) : NULL; m->Vsc = kv8 ? calloc((size_t)c->n_layers, sizeof(float*)) : NULL;
+    m->K16 = kv16 ? calloc((size_t)c->n_layers, sizeof(uint16_t*)) : NULL; m->V16 = kv16 ? calloc((size_t)c->n_layers, sizeof(uint16_t*)) : NULL;
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]){
             int64_t kvd = c->k_head_dim;
             int64_t rows = (int64_t)c->kv_heads * m->max_t;
-            if (kv8) {
+            if (kv16) {
+                /* fp16: no f32 staging and no per-row scale, 2 bytes/element. */
+                m->K[i] = NULL; m->V[i] = NULL;
+                m->K16[i] = malloc((size_t)((int64_t)c->kv_heads * m->max_t * kvd * sizeof(uint16_t)));
+                m->V16[i] = malloc((size_t)((int64_t)c->kv_heads * m->max_t * kvd * sizeof(uint16_t)));
+                if (!m->K16[i] || !m->V16[i]) { fprintf(stderr,"OOM kv16\n"); exit(1); }
+            } else if (kv8) {
                 /* fp8: the f32 K/V are never staged — only the quantised bytes
                  * and per-row scales exist, so the cache actually shrinks ~4x. */
                 m->K[i] = NULL; m->V[i] = NULL;
@@ -4857,8 +4939,14 @@ static void ensure_kv(Model *m){
                         memcpy(m->Vsc[i] + (int64_t)h*m->max_t,
                                oldVsc[i] + (int64_t)h*old_stride, (size_t)keep*sizeof(float));
                     }
+                    if (kv16 && oldK16 && oldK16[i] && oldV16 && oldV16[i]) {
+                        memcpy(m->K16[i] + (int64_t)h*m->max_t*kvd,
+                               oldK16[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(uint16_t));
+                        memcpy(m->V16[i] + (int64_t)h*m->max_t*kvd,
+                               oldV16[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(uint16_t));
+                    }
                 }
-        } else { m->K[i] = NULL; m->V[i] = NULL; if (m->K8) m->K8[i] = NULL; if (m->V8) m->V8[i] = NULL; if (m->Ksc) m->Ksc[i] = NULL; if (m->Vsc) m->Vsc[i] = NULL; }
+        } else { m->K[i] = NULL; m->V[i] = NULL; if (m->K8) m->K8[i] = NULL; if (m->V8) m->V8[i] = NULL; if (m->Ksc) m->Ksc[i] = NULL; if (m->Vsc) m->Vsc[i] = NULL; if (m->K16) m->K16[i] = NULL; if (m->V16) m->V16[i] = NULL; }
     }
     if (oldK){
         for (int i = 0; i < c->n_layers; i++){ if (oldK[i]) free(oldK[i]); if (oldV[i]) free(oldV[i]); }
@@ -4866,6 +4954,7 @@ static void ensure_kv(Model *m){
     }
     if (oldK8){ for (int i = 0; i < c->n_layers; i++){ if (oldK8[i]) free(oldK8[i]); if (oldV8[i]) free(oldV8[i]); } free(oldK8); free(oldV8); }
     if (oldKsc){ for (int i = 0; i < c->n_layers; i++){ if (oldKsc[i]) free(oldKsc[i]); if (oldVsc[i]) free(oldVsc[i]); } free(oldKsc); free(oldVsc); }
+    if (oldK16){ for (int i = 0; i < c->n_layers; i++){ if (oldK16[i]) free(oldK16[i]); if (oldV16[i]) free(oldV16[i]); } free(oldK16); free(oldV16); }
     /* Attention scores: one row per thread, indexed by absolute position, so
      * each row must hold max_t entries. Sized here rather than in attention()
      * because it grows with the context exactly like the KV cache does, and
