@@ -5606,7 +5606,7 @@ class Engine:
                     self.hits_seq += 1
                 elif kind == "PROF" and len(fields) >= 10:
                     # per-turn phase timings: where the engine spent this turn's wall time
-                    self.profile.append({
+                    entry = {
                         "wall_s": float(fields[1]),
                         "prompt_tokens": int(fields[2]),
                         "completion_tokens": int(fields[3]),
@@ -5616,7 +5616,14 @@ class Engine:
                         "attention_s": float(fields[7]),
                         "lm_head_s": float(fields[8]),
                         "forwards": int(fields[9]),
-                    })
+                    }
+                    if len(fields) >= 12:
+                        # fields[7] is attention+deltanet combined; the two below
+                        # are its split (qwen36 emits them so the KV-attention vs
+                        # DeltaNet-recurrence share is observable per turn).
+                        entry["deltanet_s"] = float(fields[10])
+                        entry["kv_attention_s"] = float(fields[11])
+                    self.profile.append(entry)
                     self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),

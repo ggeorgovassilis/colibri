@@ -5433,7 +5433,7 @@ static int qwen36_serve_budget(int np, int max_tok, int max_ctx, int read_only){
 }
 
 /* The counters when a request's decoding began: PROF and DONE report its share. */
-typedef struct { double s_disk, s_attn, s_moe, s_head, t0; } Q36ReqClock;
+typedef struct { double s_disk, s_dn, s_attn, s_moe, s_head, t0; } Q36ReqClock;
 
 /* A request's prompt into the conversation the Model holds: its tokens and image,
  * the budget, ACCEPT, the prefix reuse and the pins, the prefill and its read-out.
@@ -5527,7 +5527,7 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     float *lo = step(m, ids + reuse, np - reuse, reuse);
     qt_stats_mark();
     if (q->pin) pin_save(m, ids, np, lo);
-    clk->s_disk=m->t_disk; clk->s_attn=tm_sum(0)+tm_sum(1); clk->s_moe=tm_sum(2); clk->s_head=tm_sum(5);
+    clk->s_disk=m->t_disk; clk->s_dn=tm_sum(0); clk->s_attn=tm_sum(1); clk->s_moe=tm_sum(2); clk->s_head=tm_sum(5);
     clk->t0=now_s();
     g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
     *ids_out=ids; *np_out=np; *lo_out=lo;
@@ -5538,7 +5538,7 @@ static void serve_one(Model *m, ServeReq *q){
     int *ids=NULL, np=0; float *lo=NULL; Q36ReqClock clk;
     if(!q36_serve_start(m,q,&ids,&np,&lo,&clk)) return;
     int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */
-    const double s_disk=clk.s_disk, s_attn=clk.s_attn, s_moe=clk.s_moe, s_head=clk.s_head;
+    const double s_disk=clk.s_disk, s_dn=clk.s_dn, s_attn=clk.s_attn, s_moe=clk.s_moe, s_head=clk.s_head;
     int eos_ids[4]; int n_eos=serve_eos_ids(eos_ids,4);
     double t0=clk.t0;
     unsigned char sbuf[16]; int sbn=0;
@@ -5584,12 +5584,13 @@ static void serve_one(Model *m, ServeReq *q){
     hits_emit(m);
     {
         double disk=m->t_disk-s_disk, moe=tm_sum(2)-s_moe;
+        double dn=tm_sum(0)-s_dn, attn=tm_sum(1)-s_attn;
         /* microsecond resolution: a tiny-fixture turn on a fast runner is under
          * a millisecond, and at %.3f every phase (and the wall) printed 0.000,
          * which the dashboard tests read as "not measured" (dev CI, 2026-09-14) */
-        printf("PROF %.6f %d %d %.6f %.6f %.6f %.6f %.6f %llu\n", dt, np, gen,
-               disk, 0.0, moe>disk?moe-disk:0.0, tm_sum(0)+tm_sum(1)-s_attn, tm_sum(5)-s_head,
-               (unsigned long long)forwards);   /* contati, non dedotti: l'ultimo token non ne fa uno */
+        printf("PROF %.6f %d %d %.6f %.6f %.6f %.6f %.6f %llu %.6f %.6f\n", dt, np, gen,
+               disk, 0.0, moe>disk?moe-disk:0.0, dn+attn, tm_sum(5)-s_head,
+               (unsigned long long)forwards, dn, attn);   /* contati, non dedotti: l'ultimo token non ne fa uno */
         fflush(stdout);
     }
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n",q->id,gen,
@@ -5975,9 +5976,10 @@ static void q36_mux_finish(Model *m, Q36MuxReq *r){
     hits_emit(m);
     {
         double disk = m->t_disk - r->clk.s_disk, moe = tm_sum(2) - r->clk.s_moe;
-        printf("PROF %.6f %d %d %.6f %.6f %.6f %.6f %.6f %llu\n", dt, r->np, r->gen,
-               disk, 0.0, moe > disk ? moe - disk : 0.0, tm_sum(0) + tm_sum(1) - r->clk.s_attn,
-               tm_sum(5) - r->clk.s_head, (unsigned long long)r->forwards);
+        double dn = tm_sum(0) - r->clk.s_dn, attn = tm_sum(1) - r->clk.s_attn;
+        printf("PROF %.6f %d %d %.6f %.6f %.6f %.6f %.6f %llu %.6f %.6f\n", dt, r->np, r->gen,
+               disk, 0.0, moe > disk ? moe - disk : 0.0, dn + attn,
+               tm_sum(5) - r->clk.s_head, (unsigned long long)r->forwards, dn, attn);
         fflush(stdout);
     }
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", r->q.id, r->gen,

@@ -333,8 +333,8 @@ def _global_header(line, byte_offset):
                     raise ValueError("HITS final byte has nonzero padding bits")
         else:  # PROF
             fields = line.split(b" ")
-            if len(fields) != 10:
-                raise ValueError("expected nine PROF fields")
+            if len(fields) != 12:
+                raise ValueError("expected eleven PROF fields")
             _fixed_metric(fields[1], 3, "PROF wall seconds")
             _uint(fields[2], "PROF prompt count")
             _uint(fields[3], "PROF completion count")
@@ -342,6 +342,8 @@ def _global_header(line, byte_offset):
                     ("disk", "wait", "matmul", "attention", "head"), 4):
                 _fixed_metric(fields[index], 3, f"PROF {label} seconds")
             _uint(fields[9], "PROF forward count", _UINT64_MAX)
+            _fixed_metric(fields[10], 3, "PROF deltanet seconds")
+            _fixed_metric(fields[11], 3, "PROF kv-attention seconds")
     except (ValueError, IndexError) as exc:
         problems.append(
             f"malformed {kind.decode()} global at byte {byte_offset}: {exc}; {line!r}")
