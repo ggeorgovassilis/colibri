@@ -3117,10 +3117,46 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     }
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc((int64_t)S*H*hd);
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int hh = 0; hh < H; hh++) {
-        for (int s = 0; s < S; s++) {
-            int kvh = hh / q_per_kv;
+    if (S == 1 && !kv8 && m->attn_sc_thr >= H) {
+        /* GQA decode read-once (f32 KV): each kvh's K cache is streamed exactly
+         * once instead of once per query head in its group. The score pass is
+         * parallel over (kvh, t) and stages one score row per head into attn_sc
+         * (reused here as H rows of kv_cap cells); the context pass keeps the
+         * per-head loop. Results are bit-identical to the general path. */
+        int qpos = mr ? mr[0].pos : pos_base;
+        const float *Kl = mr ? mr[0].seq->K[layer] : m->K[layer];
+        const float *Vl = mr ? mr[0].seq->V[layer] : m->V[layer];
+        float *sc = m->attn_sc;                 /* [H * kv_cap] grouped rows */
+        const int64_t cap = m->kv_cap;
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int kvh = 0; kvh < KV; kvh++)
+            for (int t = 0; t <= qpos; t++) {
+                const float *krow = Kl + ((int64_t)kvh*m->max_t + t)*kvd;
+                for (int g = 0; g < q_per_kv; g++) {
+                    int hh = kvh*q_per_kv + g;
+                    sc[(int64_t)hh*cap + t] =
+                        dot_f32_lanes(query + (int64_t)hh*hd, krow, kvd) * scale;
+                }
+            }
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int kvh = 0; kvh < KV; kvh++)
+            for (int g = 0; g < q_per_kv; g++) {
+                int hh = kvh*q_per_kv + g;
+                float *row = sc + (int64_t)hh*cap;
+                softmax_row(row, qpos + 1);
+                float *cx = ctx + (int64_t)hh*hd;
+                for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
+                for (int t = 0; t <= qpos; t++) {
+                    const float *vrow = Vl + ((int64_t)kvh*m->max_t + t)*kvd;
+                    float a = row[t];
+                    for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
+                }
+            }
+    } else {
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int hh = 0; hh < H; hh++) {
+            for (int s = 0; s < S; s++) {
+                int kvh = hh / q_per_kv;
             int qpos = mr ? mr[s].pos : pos_base + s;
             const float *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
             const uint8_t *K8l = kv8 ? (mr ? mr[s].seq->K8[layer] : m->K8[layer]) : NULL;
@@ -3164,6 +3200,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
                 }
             }
         }
+    }
     }
     /* apply attn_output_gate: attn_out *= sigmoid(gate). Without a gate (Qwen3 MoE)
      * the output passes as it is: a missing gate is not sigmoid(0) = 0.5. */
