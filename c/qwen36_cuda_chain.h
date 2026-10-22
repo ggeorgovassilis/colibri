@@ -56,6 +56,7 @@ typedef struct {
     int ok, failed;
     int dev;                                   /* the CUDA ordinal every matrix sits on */
     int n, head;                               /* every layer, and lm_head, on the device */
+    int layer_begin, layer_end;                /* [begin,end): the layers this chain owns (a full model = [0,n_layers)) */
     int rows;                                  /* scratch capacity in rows */
     int cap;                                   /* the host's kv_cap the mirrors follow */
     CcBuf *prm;                                /* every norm / conv / DeltaNet parameter */
@@ -115,11 +116,14 @@ static void q36cc_recover(Model *m, int upto) {
     Cfg *c = &m->c; int D = c->hidden;
     g_cuda_chain = 0;
     if (ch) { ch->failed = 1; ch->dn_where = Q36CC_HOST; ch->host_zero = 0; ch->snap_valid = 0; }
-    for (int i = 0; i < c->n_layers; i++) {
+    int b = ch ? ch->layer_begin : 0, e = ch ? ch->layer_end : c->n_layers;
+    for (int i = b; i < e; i++) {
         if (c->is_attn[i]) continue;
         memset(m->DN_rec[i], 0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
         memset(m->DN_conv[i], 0, (size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float));
     }
+    /* a segment chain (a range) owns neither the embed nor the full state to rebuild on the host */
+    if (ch && (ch->layer_begin != 0 || ch->layer_end != c->n_layers)) return;
     if (upto <= 0) return;
     if (m->kvp.tainted || m->kvp.len < upto || !m->kvp.fed)
         q36cc_fatal("the device was lost with a recurrent state its token ids do not describe (an image)");
@@ -181,21 +185,21 @@ static int q36cc_take(Q36CChain *ch, ColiCudaTensor **slot, ColiCudaTensor *t, i
 }
 
 static void q36cc_free_own(Q36CChain *ch, Model *m) {
-    int L = m->c.n_layers;
-    if (ch->t_ab) for (int i = 0; i < L; i++) { if (ch->t_ab[i]) coli_cuda_tensor_free(ch->t_ab[i]); ch->t_ab[i] = NULL; }
-    if (ch->t_sg) for (int i = 0; i < L; i++) { if (ch->t_sg[i]) coli_cuda_tensor_free(ch->t_sg[i]); ch->t_sg[i] = NULL; }
-    if (ch->t_gate) for (int i = 0; i < L; i++) { if (ch->t_gate[i]) coli_cuda_tensor_free(ch->t_gate[i]); ch->t_gate[i] = NULL; }
-    if (ch->rec) for (int i = 0; i < L; i++) { cc_free(ch->rec[i]); ch->rec[i] = NULL; }
-    if (ch->ring) for (int i = 0; i < L; i++) { cc_free(ch->ring[i]); ch->ring[i] = NULL; }
-    if (ch->kc) for (int i = 0; i < L; i++) { cc_free(ch->kc[i]); ch->kc[i] = NULL; }
-    if (ch->vc) for (int i = 0; i < L; i++) { cc_free(ch->vc[i]); ch->vc[i] = NULL; }
+    int b = ch->layer_begin, e = ch->layer_end;
+    if (ch->t_ab) for (int i = b; i < e; i++) { if (ch->t_ab[i]) coli_cuda_tensor_free(ch->t_ab[i]); ch->t_ab[i] = NULL; }
+    if (ch->t_sg) for (int i = b; i < e; i++) { if (ch->t_sg[i]) coli_cuda_tensor_free(ch->t_sg[i]); ch->t_sg[i] = NULL; }
+    if (ch->t_gate) for (int i = b; i < e; i++) { if (ch->t_gate[i]) coli_cuda_tensor_free(ch->t_gate[i]); ch->t_gate[i] = NULL; }
+    if (ch->rec) for (int i = b; i < e; i++) { cc_free(ch->rec[i]); ch->rec[i] = NULL; }
+    if (ch->ring) for (int i = b; i < e; i++) { cc_free(ch->ring[i]); ch->ring[i] = NULL; }
+    if (ch->kc) for (int i = b; i < e; i++) { cc_free(ch->kc[i]); ch->kc[i] = NULL; }
+    if (ch->vc) for (int i = b; i < e; i++) { cc_free(ch->vc[i]); ch->vc[i] = NULL; }
     cc_free(ch->prm); ch->prm = NULL;
 }
 
 /* The chain on the device, at startup after the tier placed the trunk: every layer's
  * matrices found on one device, the parameter arena, the chain's own small tensors and
  * the DeltaNet state. NULL = the chain cannot run (the message says why). */
-static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
+static Q36CChain *q36cc_setup_range(Model *m, int mux_slots, int layer_begin, int layer_end) {
     Cfg *c = &m->c; int L = c->n_layers, D = c->hidden;
     if (m->cchain) return ((Q36CChain *)m->cchain)->ok ? (Q36CChain *)m->cchain : NULL;
     if (!cc_available()) { fprintf(stderr, "[chain] qwen36: the CUDA backend has no chain (an older DLL); the per-matrix path\n"); return NULL; }
@@ -214,6 +218,7 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     if (!ch) return NULL;
     m->cchain = ch;
     ch->dev = -1;
+    ch->layer_begin = layer_begin; ch->layer_end = layer_end; ch->head = (layer_begin == 0 && layer_end == L);
     ch->o_in = calloc(L, sizeof(size_t)); ch->o_post = calloc(L, sizeof(size_t)); ch->o_qn = calloc(L, sizeof(size_t));
     ch->o_kn = calloc(L, sizeof(size_t)); ch->o_conv = calloc(L, sizeof(size_t)); ch->o_dn = calloc(L, sizeof(size_t));
     ch->t_ab = calloc(L, sizeof(void *)); ch->t_sg = calloc(L, sizeof(void *)); ch->t_gate = calloc(L, sizeof(void *));
@@ -229,7 +234,7 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     /* the tier's matrices, every one on one device */
     /* (the accessor fills `d` before q36cc_take reads it: two statements, not one call) */
 #define Q36CC_TAKE(slot, expr, what) do { int d_ = -1; ColiCudaTensor *t_ = (expr); if (!q36cc_take(ch, (slot), t_, d_, (what), i)) return NULL; } while (0)
-    for (int i = 0; i < L; i++) {
+    for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
         if (c->is_attn[i]) {
             Q36CC_TAKE(&ch->t_q[i], qt_dense_tensor(l->qth_q - 1, &d_), "q_proj");
@@ -246,14 +251,13 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
             Q36CC_TAKE(&ch->t_shd[i], qt_dense_tensor(l->qth_shd - 1, &d_), "the shared expert's down");
         }
     }
-    { int i = 0; Q36CC_TAKE(&ch->t_lm, qt_lmhead_tensor(&d_), "lm_head"); }
+    if (ch->head) { int i = 0; Q36CC_TAKE(&ch->t_lm, qt_lmhead_tensor(&d_), "lm_head"); }
 #undef Q36CC_TAKE
-    ch->head = 1;
     if (!cc_init(ch->dev)) { fprintf(stderr, "[chain] qwen36: the chain's context on device %d did not come up\n", ch->dev); return NULL; }
     /* the parameter arena: offsets, then one upload */
     size_t np = 0;
     int vh = c->dn_vheads, conv_dim = c->dn_conv_dim, convk = c->dn_convk;
-    for (int i = 0; i < L; i++) {
+    for (int i = layer_begin; i < layer_end; i++) {
         ch->o_in[i] = np; np += D; ch->o_post[i] = np; np += D;
         if (c->is_attn[i]) {
             if (m->L[i].qn) { ch->o_qn[i] = np; np += c->head_dim; }
@@ -263,10 +267,10 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
             ch->o_dn[i] = np; np += 2 * (size_t)vh + c->dn_vdim;
         }
     }
-    ch->o_final = np; np += D;
+    ch->o_final = np; if (ch->head) np += D;
     float *arena = calloc(np, sizeof(float));
     if (!arena) return NULL;
-    for (int i = 0; i < L; i++) {
+    for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
         memcpy(arena + ch->o_in[i], l->in_ln, D * sizeof(float));
         memcpy(arena + ch->o_post[i], l->post_ln, D * sizeof(float));
@@ -280,13 +284,13 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
             memcpy(arena + ch->o_dn[i] + 2 * vh, l->dn_norm, c->dn_vdim * sizeof(float));
         }
     }
-    memcpy(arena + ch->o_final, m->final_norm, D * sizeof(float));
+    if (ch->head) memcpy(arena + ch->o_final, m->final_norm, D * sizeof(float));
     ch->prm = cc_buf(np * sizeof(float), CC_DEV);
     int ok = ch->prm && cc_begin() && cc_write(ch->prm, 0, arena, np * sizeof(float)) && cc_submit(1);
     free(arena);
     /* the chain's own tensors and the DeltaNet state */
     size_t own = 0;
-    for (int i = 0; i < L && ok; i++) {
+    for (int i = layer_begin; i < layer_end && ok; i++) {
         Layer *l = &m->L[i];
         if (!c->is_attn[i]) {
             float *ab = malloc((size_t)2 * vh * D * sizeof(float));
@@ -308,7 +312,7 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
         q36cc_free_own(ch, m);
         return NULL;
     }
-    ch->n = L;
+    ch->n = layer_end - layer_begin;
     ch->dn_where = Q36CC_HOST; ch->host_zero = 0;
     { const char *e = getenv("COLI_CUDA_CHAIN_FAULT"); ch->fault_at = e && *e ? strtoull(e, NULL, 10) : 0; }
     ch->ok = 1;
@@ -316,12 +320,13 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     if (ch->dm_on) fprintf(stderr, "[chain] qwen36: a decode step's routed experts in the frame (the tier's residents by address, "
                                    "format %d%s, group %d; COLI_CUDA_CHAIN_MOE=0: the host's step)\n", ch->dm_fmt,
                                    ch->dm_fmt >= 100 ? " (a GGUF's blocks, by layer)" : "", ch->dm_gs);
-    fprintf(stderr, "[chain] qwen36: %d layers on CUDA device %d (%d attention), lm_head too; %.1f MiB of parameters, "
+    fprintf(stderr, "[chain] qwen36: %d layers on CUDA device %d (%d attention)%s; %.1f MiB of parameters, "
                     "%.1f MiB of router, b|a and gate rows, %.0f MB of DeltaNet state\n",
-            L, ch->dev, ch->n_attn, np * 4 / 1048576.0, own / 1048576.0,
-            (double)(L - ch->n_attn) * ((double)vh * c->dn_kdim * c->dn_vdim + (double)conv_dim * (convk - 1)) * 4 / 1e6);
+            ch->n, ch->dev, ch->n_attn, ch->head ? ", lm_head too" : "", np * 4 / 1048576.0, own / 1048576.0,
+            (double)(ch->n - ch->n_attn) * ((double)vh * c->dn_kdim * c->dn_vdim + (double)conv_dim * (convk - 1)) * 4 / 1e6);
     return ch;
 }
+static Q36CChain *q36cc_setup(Model *m, int mux_slots) { return q36cc_setup_range(m, mux_slots, 0, m->c.n_layers); }
 
 /* the scratch buffers for `rows` rows */
 static int q36cc_bufs(Q36CChain *ch, Model *m, int rows) {
@@ -346,7 +351,7 @@ static int q36cc_bufs(Q36CChain *ch, Model *m, int rows) {
 static int q36cc_mirror(Q36CChain *ch, Model *m) {
     Cfg *c = &m->c; int KV = c->kv_heads;
     if (ch->cap != m->kv_cap) {
-        for (int i = 0; i < c->n_layers; i++) {
+        for (int i = ch->layer_begin; i < ch->layer_end; i++) {
             if (!c->is_attn[i]) continue;
             cc_free(ch->kc[i]); cc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
             ch->kv_valid[i] = 0;
@@ -375,7 +380,7 @@ static int q36cc_sync_one(Model *m, Q36CChain *ch) {
     Cfg *c = &m->c;
     size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
     int ok = 1;
-    for (int i = 0; i < c->n_layers && ok; i++) {
+    for (int i = ch->layer_begin; i < ch->layer_end && ok; i++) {
         if (c->is_attn[i]) continue;
         ok = cc_read(ch->rec[i], 0, m->DN_rec[i], nr * sizeof(float)) &&
              cc_read(ch->ring[i], 0, m->DN_conv[i], nc * sizeof(float));
@@ -399,16 +404,16 @@ static void q36cc_cpu_step(Model *m, int pos_base) {
     if (!ch || !ch->ok) return;
     if (!q36cc_sync_one(m, ch)) { q36cc_recover(m, m->kv_len); return; }
     ch->dn_where = Q36CC_HOST; ch->host_zero = 0; ch->snap_valid = 0;
-    for (int i = 0; i < m->c.n_layers; i++) if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
+    for (int i = ch->layer_begin; i < ch->layer_end; i++) if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
 }
 /* A rejected draft: the state after the verify's row `slot` is the device's copy in
  * that slot; `len` positions stand, and the KV watermark comes down to them. */
 static void q36cc_rollback(Model *m, int slot, int len) {
     Q36CChain *ch = q36cc_of(m);
     if (!ch || !ch->ok) return;
-    for (int i = 0; i < m->c.n_layers; i++) if (ch->kv_valid[i] > len) ch->kv_valid[i] = len;
+    for (int i = ch->layer_begin; i < ch->layer_end; i++) if (ch->kv_valid[i] > len) ch->kv_valid[i] = len;
     if (slot < 0 || slot >= ch->snap_valid || ch->dn_where != Q36CC_DEV) { ch->snap_valid = 0; return; }
-    for (int i = 0; i < m->c.n_layers; i++) {
+    for (int i = ch->layer_begin; i < ch->layer_end; i++) {
         if (m->c.is_attn[i]) continue;
         CcBuf *t = ch->rec[i]; ch->rec[i] = ch->rec_snap[slot][i]; ch->rec_snap[slot][i] = t;
         t = ch->ring[i]; ch->ring[i] = ch->ring_snap[slot][i]; ch->ring_snap[slot][i] = t;
@@ -422,7 +427,7 @@ static int q36cc_spec_slots(Q36CChain *ch, Model *m, int rows) {
     for (int sl = ch->snap_slots; sl < rows; sl++) {
         if (!ch->rec_snap[sl] && !(ch->rec_snap[sl] = (CcBuf **)calloc((size_t)L, sizeof(CcBuf *)))) return 0;
         if (!ch->ring_snap[sl] && !(ch->ring_snap[sl] = (CcBuf **)calloc((size_t)L, sizeof(CcBuf *)))) return 0;
-        for (int i = 0; i < L; i++) {
+        for (int i = ch->layer_begin; i < ch->layer_end; i++) {
             if (c->is_attn[i]) continue;
             if (!ch->rec_snap[sl][i] && !(ch->rec_snap[sl][i] = cc_buf(nr * sizeof(float), CC_DEV))) return 0;
             if (!ch->ring_snap[sl][i] && !(ch->ring_snap[sl][i] = cc_buf(nc * sizeof(float), CC_DEV))) return 0;
@@ -436,7 +441,7 @@ static int q36cc_push_state(Q36CChain *ch, Model *m, int pos_base) {
     Cfg *c = &m->c; int ok = 1;
     if (ch->dn_where == Q36CC_HOST) {
         size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
-        for (int i = 0; i < c->n_layers && ok; i++) {
+        for (int i = ch->layer_begin; i < ch->layer_end && ok; i++) {
             if (c->is_attn[i]) continue;
             if (ch->host_zero) ok = cc_zero(ch->rec[i], 0, nr) && cc_zero(ch->ring[i], 0, nc);
             else ok = cc_write(ch->rec[i], 0, m->DN_rec[i], nr * sizeof(float)) &&
@@ -445,7 +450,7 @@ static int q36cc_push_state(Q36CChain *ch, Model *m, int pos_base) {
         ch->dn_where = Q36CC_BOTH;
     }
     int kvd = c->k_head_dim, KV = c->kv_heads;
-    for (int i = 0; i < c->n_layers && ok; i++) {
+    for (int i = ch->layer_begin; i < ch->layer_end && ok; i++) {
         if (!c->is_attn[i] || ch->kv_valid[i] >= pos_base) continue;
         int t0 = ch->kv_valid[i], n = pos_base - t0;
         for (int h = 0; h < KV && ok; h++) {
@@ -815,6 +820,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
     Q36CChain *ch = q36cc_of(m);
     if (!ch || !ch->ok || ch->failed) return 0;
     Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, E = c->n_experts;
+    int b = ch->layer_begin, e = ch->layer_end;
     int CH = q36cc_rows_max(ch, m), rows = S < CH ? S : CH;
     int kvo = c->kv_heads * c->k_head_dim, half = c->rotary_dim / 2;
     if (m->snap_rows > 0 && !q36cc_spec_slots(ch, m, m->snap_rows)) {
@@ -865,7 +871,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         int ok = 1, pending = 0, pend_i = -1;   /* pend_i: the hybrid layer the host serves after recording the next */
         unsigned pend_v = 0;
         CcBuf *routed = ch->routed;              /* where the layer before left its routed sum */
-        for (int i = 0; i < L && ok; i++) {
+        for (int i = b; i < e && ok; i++) {
             Layer *l = &m->L[i];
             if (pending) {
                 ok = q36cc_combine(ch, m, i - 1, n, routed);
@@ -916,17 +922,17 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                 routed = ch->routed;
             } else if (ok) {
                 ok = q36cc_shared(ch, m, l, i, n);
-                if (ok && i + 1 < L) ok = cc_submit(0) && q36cc_frame_begin(ch);
+                if (ok && i + 1 < e) ok = cc_submit(0) && q36cc_frame_begin(ch);
             }
             pending = 1;
         }
-        if (ok) ok = q36cc_combine(ch, m, L - 1, n, routed);
+        if (ok) ok = q36cc_combine(ch, m, e - 1, n, routed);
         if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(L - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
         if (ok && want_x) ok = cc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);
         int last = c0 + n == S;
         /* the final norm and lm_head on this chunk's share of the last nlogits rows */
         int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = nlogits ? n - lo0 : 0;
-        if (ok && lo_n > 0) {
+        if (ok && lo_n > 0 && ch->head) {
             int dst = c0 + lo0 - (S - nlogits);
             ok = q36cc_norm(ch->x, (size_t)lo0 * D, ch->prm, ch->o_final, ch->fin, (size_t)dst * D, lo_n, D, c->eps) &&
                  cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->outd, (size_t)dst * c->vocab, lo_n);
@@ -938,7 +944,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         ch->wait_ms += tm_now() - t0;
         if (!ok) goto lost;
         if (dm) q36cc_dm_books(ch, m, n, pb);
-        if (E == 0) for (int i = 0; i < L; i++) {           /* a dense model reads its K/V rows back here */
+        if (E == 0) for (int i = b; i < e; i++) {           /* a dense model reads its K/V rows back here */
             if (!c->is_attn[i]) continue;
             const float *kv = (const float *)cc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
             for (int s = 0; s < n; s++) for (int h = 0; h < c->kv_heads; h++) {
@@ -948,16 +954,16 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             }
         }
         if (want_x) memcpy(xh + (size_t)c0 * D, cc_ptr(ch->xd), (size_t)n * D * sizeof(float));
-        for (int i = 0; i < L; i++) if (c->is_attn[i]) ch->kv_valid[i] = pb + n;
+        for (int i = b; i < e; i++) if (c->is_attn[i]) ch->kv_valid[i] = pb + n;
         ch->dn_where = Q36CC_DEV; ch->host_zero = 0;
-        if (last) memcpy(logit, cc_ptr(ch->outd), (size_t)nlogits * c->vocab * sizeof(float));
+        if (last && nlogits > 0) memcpy(logit, cc_ptr(ch->outd), (size_t)nlogits * c->vocab * sizeof(float));
     }
     q36cc_dm_end(ch);
     if (lf) fwrite(cc_ptr(ch->lfd), sizeof(float), (size_t)L * 3 * D, lf);
     ch->snap_valid = snapped;
     ch->forwards++;
     if (S == 1) { ch->dec_n++; ch->dec_wait_ms += ch->wait_ms - w0; ch->dec_host_ms += ch->host_ms - h0; }
-    return L;
+    return e - b;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     if (!cc_lost()) cc_finish();
     q36cc_dm_end(ch);
