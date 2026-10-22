@@ -60,13 +60,17 @@ static struct {
     pthread_cond_t cv;
     /* statistics */
     uint64_t hits[QT_MAX_DEV], miss, uploads, q_full_skips;
-    /* issue state of the (single) decode thread */
+    /* issue state of the decode thread(s). is_cnt/is_k/is_x are indexed per
+     * device and a call touches only the devices it routes resident experts
+     * to, so two threads on disjoint devices (M3: stage 0 on GPU 0, stage 1
+     * on GPU 1) do not clobber each other. issue_open is per-device too: the
+     * swap/evict path waits on the victim's device only. */
     int is_cnt[QT_MAX_DEV];
     int is_k[QT_MAX_DEV][QT_MAX_ROWS];
     float *is_x; size_t is_x_floats;      /* QT_MAX_ROWS*D input replicas per device */
     /* M3 */
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
-    int issue_open;                       /* guard: no tensor_free while a group is in flight */
+    int issue_open[QT_MAX_DEV];           /* guard: no tensor_free while that device's group is in flight */
     pthread_cond_t cv_take;               /* signals qt_take done + queue space */
     uint64_t tick, swaps, inplace, pf_hits, pf_notes;
     uint32_t *heat0;                      /* heat table loaded from HEAT_FILE */
@@ -81,6 +85,11 @@ static struct {
     unsigned epoch; int chain_hold;
 } G;
 #define QT_EV_CAP 8192
+
+/* M3: the devices THIS thread's qt_issue opened, consumed by its qt_take.
+ * Per-thread so two stage threads on disjoint devices clear only their own
+ * issue_open. Set on every qt_issue, including early returns (which set 0). */
+static _Thread_local uint32_t g_issue_devs = 0;
 
 /* Count parked callers so shutdown can reclaim their shared storage safely. */
 static void wait_take_locked(void){
@@ -267,10 +276,12 @@ static void *uploader(void *arg){
             else { int hi=home2(layer,eid); if(G_anfree[hi]>0) aslot=G_afree[hi][--G_anfree[hi]]; }
         }
         if(ve>=0){
-            /* LFRU swap: touch the victim only when no group and no chain forward is in flight */
-            while((G.issue_open||G.chain_hold) && !G.th_stop) wait_take_locked();
+            /* LFRU swap: touch the victim only when no group on ITS device and
+             * no chain forward is in flight (M3: per-device issue_open). */
+            int vdi = home2(vl,ve);
+            while((G.issue_open[vdi]||G.chain_hold) && !G.th_stop) wait_take_locked();
             QSlot *v=qs(vl,ve);
-            if(G.th_stop && (G.issue_open||G.chain_hold)){
+            if(G.th_stop && (G.issue_open[vdi]||G.chain_hold)){
                 /* Shutting down with a group still open: qt_take() -- the only
                  * thing that clears issue_open -- will never come. Abandon
                  * this swap instead of freeing a victim tensor the in-flight
@@ -1785,7 +1796,8 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     ColiCudaTensor *tg[QT_MAX_DEV][QT_MAX_ROWS],*tu[QT_MAX_DEV][QT_MAX_ROWS],*td[QT_MAX_DEV][QT_MAX_ROWS];
     static int rows[QT_MAX_ROWS]={0};
     if(!rows[0]) for(int i=0;i<QT_MAX_ROWS;i++) rows[i]=1;
-    for(int i=0;i<G.ndev;i++) G.is_cnt[i]=0;
+    uint32_t opened=0;                     /* devices this call routes resident experts to */
+    g_issue_devs=0;                        /* no stale group for a later qt_take */
 
     pthread_mutex_lock(&G.mx);
     /* QT_UPLOAD_SYNC=1: everything enqueued so far is resident before this
@@ -1798,7 +1810,6 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
     if(G.th_stop){ pthread_mutex_unlock(&G.mx); return 0; }
     if(layer==0) qt_lfru_tick_locked();
-    G.issue_open=1;
     for(int k=0;k<K;k++){
         QSlot *s=qs(layer,eids[k]);
         if(s->resident){
@@ -1806,13 +1817,18 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
              * CPU computes, so without this a resident in copy mode never warmed
              * again and the coldest-resident test let any newcomer evict it */
             if(s->heat<0xFFFFFFFFu) s->heat++;
-            int di=home2(layer,eids[k]); int c=G.is_cnt[di];
+            int di=home2(layer,eids[k]);
+            if(!(opened & (1u<<di))){       /* first touch: reset THIS device only */
+                opened|=1u<<di; G.is_cnt[di]=0; G.issue_open[di]=1;
+            }
+            int c=G.is_cnt[di];
             tg[di][c]=s->tg; tu[di][c]=s->tu; td[di][c]=s->td;
             G.is_k[di][c]=k; G.is_cnt[di]=c+1;
             mask|=1u<<k; G.hits[di]++;
         } else G.miss++;
     }
     pthread_mutex_unlock(&G.mx);
+    g_issue_devs=opened;
 
     for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
@@ -1831,10 +1847,12 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
 int qt_take(uint32_t mask,const float *val,int K,float *out){
     (void)K;
     if(!G.on) return mask==0;
+    uint32_t opened=g_issue_devs;           /* only THIS thread's group (M3) */
     const float *result[QT_MAX_DEV]={0};
     int ok=1;
     /* Drain every device before deciding whether this layer is usable. */
     if(mask) for(int di=0;di<G.ndev;di++){
+        if(!(opened & (1u<<di))) continue;
         if(!G.is_cnt[di]) continue;
         result[di]=coli_cuda_expert_group_take(G.dev[di]);
         if(!result[di]){
@@ -1844,6 +1862,7 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
     }
     /* Do not publish a partial contribution when any device failed. */
     for(int di=0;di<G.ndev;di++){
+        if(!(opened & (1u<<di))) continue;
         if(ok && result[di]) for(int j=0;j<G.is_cnt[di];j++){
             float w=val[G.is_k[di][j]];
             const float *row=result[di]+(size_t)j*G.D;
@@ -1852,7 +1871,7 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
         G.is_cnt[di]=0;
     }
     pthread_mutex_lock(&G.mx);
-    G.issue_open=0;
+    for(int di=0;di<G.ndev;di++) if(opened & (1u<<di)) G.issue_open[di]=0;
     pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
     return ok;
@@ -1950,7 +1969,7 @@ void qt_shutdown(void){
     pthread_cond_destroy(&G.cv_take);
     pthread_cond_destroy(&G.cv);
     pthread_mutex_destroy(&G.mx);
-    G.issue_open=0;
+    memset(G.issue_open,0,sizeof G.issue_open);
     memset(G.is_cnt,0,sizeof G.is_cnt);
     G.on=0;
     G_fp8_stream=0; G_stream=0; G_trunk_only=0; G_src_planar=0;

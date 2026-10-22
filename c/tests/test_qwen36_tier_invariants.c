@@ -279,7 +279,7 @@ static void test_shutdown_wakes_everyone(void) {
     float x[D]; for (int i = 0; i < D; i++) x[i] = (float)i;
     int e0 = 0; (void)qt_issue(0, &e0, 1, x);
     pthread_mutex_lock(&G.mx);
-    check(G.issue_open == 1, "a group must be open after qt_issue");
+    check(G.issue_open[0] == 1, "a group must be open after qt_issue");
     /* fill the queue to capacity with swaps against the one victim, so that
      * the uploader parks on the victim wait AND the queue reads full */
     qs(0, 0)->resident = 0;
@@ -420,7 +420,8 @@ static void test_issue_geometry(int ndev, int seeds) {
         memset(out, 0, sizeof out);
         qt_take(mask, val, K, out);
         pthread_mutex_lock(&G.mx);
-        check(G.issue_open == 0, "qt_take must close the group");
+        for (int di = 0; di < G.ndev; di++)
+            check(G.issue_open[di] == 0, "qt_take must close the group on every device");
         for (int e = 0; e < NE; e++) if (knocked[e]) qs(0, e)->resident = 1;   /* restore for the next round */
         pthread_mutex_unlock(&G.mx);
         if (fails) { printf("  (stopping the geometry sweep at seed %d, ndev %d, K %d)\n", s, ndev, K); break; }

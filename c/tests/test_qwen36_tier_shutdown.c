@@ -176,7 +176,7 @@ int main(void) {
     pthread_mutex_unlock(&G.mx);
     pthread_join(issuer,NULL);
     check(stopped_issue_mask==0,"stopped issuer must return CPU fallback mask");
-    check(!G.issue_open && !G.is_cnt[0],"stopped issuer must not open a GPU group");
+    check(!G.issue_open[0] && !G.is_cnt[0],"stopped issuer must not open a GPU group");
     qt_shutdown();
 
     if (fails) { printf("test_qwen36_tier_shutdown: %d fallimenti\n", fails); return 1; }
