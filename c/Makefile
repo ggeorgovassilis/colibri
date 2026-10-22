@@ -547,6 +547,8 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32
 # needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
 TEST_EXCLUDE += test_cu_tier
+# CUDA Segment engine object (qwen36): make segment-cuda CUDA=1 CUDA_ARCH=sm_60
+TEST_EXCLUDE += test_segment_cuda_registration
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
@@ -2615,6 +2617,14 @@ SEGMENT_RUNTIME_OBJS = \
 	$(SEGMENT_BUILD_DIR)/segment_runtime.o \
 	$(SEGMENT_BUILD_DIR)/edge_runtime.o
 SEGMENT_RUNTIME_LIB = $(SEGMENT_BUILD_DIR)/libcolibri_segment_edge.a
+# CUDA-backed Segment engine object (M0): qwen36.c compiled once more with the
+# CUDA backend enabled so the dense-chain range adapter can bind a layer range
+# to a device. Kept out of SEGMENT_ALL_OBJS so ordinary CPU segment builds and
+# executables never link it. Requires CUDA=1 to actually enable -DCOLI_CUDA;
+# without it this is just the CPU adapter under a different object name.
+SEGMENT_CUDA_CFLAGS = $(CFLAGS) -include pthread.h \
+	-DCOLI_SEGMENT_ADAPTER -DCOLI_EDGE_ADAPTER
+SEGMENT_CUDA_QWEN36_OBJ = $(SEGMENT_BUILD_DIR)/qwen36_cuda.o
 
 $(SEGMENT_BUILD_DIR):
 	mkdir -p $@
@@ -2636,6 +2646,9 @@ $(SEGMENT_BUILD_DIR)/olmoe.o: olmoe.c | $(SEGMENT_BUILD_DIR)
 
 $(SEGMENT_BUILD_DIR)/qwen36.o: qwen36.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DQWEN36_NO_MAIN -c qwen36.c -o $@
+
+$(SEGMENT_BUILD_DIR)/qwen36_cuda.o: qwen36.c | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CUDA_CFLAGS) -DQWEN36_NO_MAIN -c qwen36.c -o $@
 
 $(SEGMENT_BUILD_DIR)/qwen38.o: qwen38.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DQWEN38_NO_MAIN -c qwen38.c -o $@
@@ -2671,6 +2684,18 @@ tests/test_segment_adapters_real$(EXE): tests/test_segment_adapters_real.c \
 	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_segment_adapters_real.c \
 		segment_runtime.c edge_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
 
+# M0a link gate: the qwen36 CUDA segment object must register into the segment
+# runtime against the CUDA backend. segment_runtime.c/edge_runtime.c stay
+# CUDA-free (SEGMENT_CPU_CFLAGS); only the qwen36 engine object and the tier +
+# CUDA objects carry the CUDA backend, linked with $(LDFLAGS).
+tests/test_segment_cuda_registration$(EXE): \
+		tests/test_segment_cuda_registration.c segment_runtime.c \
+		edge_runtime.c segment_runtime.h edge_runtime.h segment_adapters.h \
+		edge_adapters.h $(SEGMENT_CUDA_QWEN36_OBJ) $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_segment_cuda_registration.c \
+		segment_runtime.c edge_runtime.c $(SEGMENT_CUDA_QWEN36_OBJ) \
+		$(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(LDFLAGS)
+
 tests/test_edge_adapters_registration$(EXE): \
 		tests/test_edge_adapters_registration.c edge_runtime.c segment_runtime.c \
 		edge_runtime.h segment_runtime.h edge_adapters.h $(SEGMENT_ALL_OBJS)
@@ -2683,9 +2708,14 @@ tests/test_edge_adapters_real$(EXE): tests/test_edge_adapters_real.c \
 	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_edge_adapters_real.c \
 		edge_runtime.c segment_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
 
-.PHONY: segment-adapters segment-adapters-real
+.PHONY: segment-adapters segment-adapters-real segment-cuda
 segment-adapters: tests/test_segment_adapters_registration$(EXE)
 	./tests/test_segment_adapters_registration$(EXE)
+
+# CUDA Segment registration gate (M0a). Needs a CUDA toolchain and device:
+#   make segment-cuda CUDA=1 CUDA_ARCH=sm_60
+segment-cuda: tests/test_segment_cuda_registration$(EXE)
+	./tests/test_segment_cuda_registration$(EXE)
 
 .PHONY: edge-adapters edge-adapters-real
 edge-adapters: tests/test_edge_adapters_registration$(EXE)
