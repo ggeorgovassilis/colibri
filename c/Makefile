@@ -2756,6 +2756,19 @@ tests/test_pipeline_cuda_real$(EXE): \
 		segment_runtime.c edge_runtime.c $(SEGMENT_CUDA_QWEN36_OBJ) \
 		$(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
+# M3c CUDA build: the lock-step 2-stage x 2-batch overlap ring over the
+# CUDA-backed Segment path. COLI_GPUS=0,1 + QT_HOME=layer + QT_LAYER_SPLIT
+# home stage 0 ([0, split)) to device 0 and stage 1 ([split, n)) to device 1,
+# while the full-range reference engine (spanning both devices) declines its
+# chain and runs the CPU reference the pipelined tokens are checked against.
+tests/test_pipeline_cuda_overlap$(EXE): \
+		tests/test_pipeline_overlap.c segment_runtime.c edge_runtime.c \
+		segment_runtime.h edge_runtime.h segment_adapters.h \
+		edge_adapters.h json.h $(SEGMENT_CUDA_QWEN36_OBJ) $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_pipeline_overlap.c \
+		segment_runtime.c edge_runtime.c $(SEGMENT_CUDA_QWEN36_OBJ) \
+		$(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(LDFLAGS)
+
 .PHONY: segment-adapters segment-adapters-real segment-cuda
 segment-adapters: tests/test_segment_adapters_registration$(EXE)
 	./tests/test_segment_adapters_registration$(EXE)
@@ -2871,6 +2884,19 @@ pipeline-observability: pipeline-overlap pipeline-synthetic
 pipeline-cuda-real: tests/test_pipeline_cuda_real$(EXE)
 	@test -n "$(QWEN_PIPELINE_MODEL)" || { echo "set QWEN_PIPELINE_MODEL" >&2; exit 2; }
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_pipeline_cuda_real$(EXE) \
+		qwen36 "$(QWEN_PIPELINE_MODEL)" 20 3
+
+# M3c pipeline overlap driver, CUDA (real model on rig1, two GPUs): stage 0
+# ([0, split)) runs on device 0 and stage 1 ([split, n)) on device 1, overlapped
+# on two threads, bit-identical to the serial full-range decode. Needs two
+# visible devices (docker --gpus all). QT_LAYER_SPLIT mirrors the SPLIT arg.
+#   make pipeline-cuda-overlap CUDA=1 CUDA_ARCH=sm_60 \
+#     QWEN_PIPELINE_MODEL=/path/to/qwen36_i4_gs64
+.PHONY: pipeline-cuda-overlap
+pipeline-cuda-overlap: tests/test_pipeline_cuda_overlap$(EXE)
+	@test -n "$(QWEN_PIPELINE_MODEL)" || { echo "set QWEN_PIPELINE_MODEL" >&2; exit 2; }
+	COLI_GPUS=0,1 QT_HOME=layer QT_LAYER_SPLIT=20 \
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_pipeline_cuda_overlap$(EXE) \
 		qwen36 "$(QWEN_PIPELINE_MODEL)" 20 3
 
 V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
@@ -3494,7 +3520,7 @@ tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c tests
 AUTODEP_ELSEWHERE = test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real test_deepseek_v4 \
 	test_v4_serve_framing test_pipeline_real test_pipeline_cuda_real \
-	test_pipeline_overlap
+	test_pipeline_overlap test_pipeline_cuda_overlap
 AUTODEP_OWN_FLAGS = bench_cuda_resident_batch bench_load_tq_peak_rss \
 	bench_indexer_allocations
 ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))

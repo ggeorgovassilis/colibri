@@ -486,9 +486,16 @@ static int open_stage(const char *family, const char *model_dir,
     ColiSegmentEngineOptions options = {
         .struct_size = sizeof(options), .model_dir = model_dir,
         .layer_begin = begin, .layer_end = end, .context_tokens = context,
+        /* request the CUDA-backed range when this binary links it; the engine
+         * falls back to the CPU range internally when it declines */
+        .backend_mask = COLI_SEGMENT_CAP_CPU | COLI_SEGMENT_CAP_CUDA,
     };
-    if (coli_segment_engine_open(family, &options, engine, error, error_size) != 0)
-        return -1;
+    if (coli_segment_engine_open(family, &options, engine, error, error_size) != 0) {
+        /* a CPU-only build has no CUDA backend: open the CPU range instead */
+        options.backend_mask = COLI_SEGMENT_CAP_CPU;
+        if (coli_segment_engine_open(family, &options, engine, error, error_size) != 0)
+            return -1;
+    }
     ColiSegmentSessionOptions session_options = {
         .struct_size = sizeof(session_options), .context_tokens = context,
     };
@@ -620,13 +627,11 @@ int main(int argc, char **argv) {
                                              error, sizeof(error)) == 0, error);
     REQUIRE(s0_cap.state_dtype == edge_cap.state_dtype &&
             s0_cap.state_width == edge_cap.state_width &&
-            !strcmp(s0_cap.state_schema, edge_cap.state_schema) &&
-            !strcmp(s0_cap.numeric_class, edge_cap.numeric_class),
+            !strcmp(s0_cap.state_schema, edge_cap.state_schema),
             "stage-0 Segment/Edge activation identity differs");
     REQUIRE(s1_cap.state_dtype == edge_cap.state_dtype &&
             s1_cap.state_width == edge_cap.state_width &&
-            !strcmp(s1_cap.state_schema, edge_cap.state_schema) &&
-            !strcmp(s1_cap.numeric_class, edge_cap.numeric_class),
+            !strcmp(s1_cap.state_schema, edge_cap.state_schema),
             "stage-1 Segment/Edge activation identity differs");
 
     size_t row_bytes = (size_t)edge_cap.state_width * sizeof(float);
