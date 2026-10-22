@@ -2696,6 +2696,18 @@ tests/test_segment_cuda_registration$(EXE): \
 		segment_runtime.c edge_runtime.c $(SEGMENT_CUDA_QWEN36_OBJ) \
 		$(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
+# M0-verify: a CUDA-backed qwen36 Segment range must equal the chained halves
+# of the same range (identical int8 quantization, tight tolerance) and
+# round-trip its snapshot.
+tests/test_segment_cuda_real$(EXE): \
+		tests/test_segment_cuda_real.c segment_runtime.c edge_runtime.c \
+		segment_runtime.h edge_runtime.h segment_adapters.h \
+		segment_adapter_internal.h edge_adapters.h \
+		$(SEGMENT_CUDA_QWEN36_OBJ) $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_segment_cuda_real.c \
+		segment_runtime.c edge_runtime.c $(SEGMENT_CUDA_QWEN36_OBJ) \
+		$(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(LDFLAGS)
+
 tests/test_edge_adapters_registration$(EXE): \
 		tests/test_edge_adapters_registration.c edge_runtime.c segment_runtime.c \
 		edge_runtime.h segment_runtime.h edge_adapters.h $(SEGMENT_ALL_OBJS)
@@ -2716,6 +2728,15 @@ segment-adapters: tests/test_segment_adapters_registration$(EXE)
 #   make segment-cuda CUDA=1 CUDA_ARCH=sm_60
 segment-cuda: tests/test_segment_cuda_registration$(EXE)
 	./tests/test_segment_cuda_registration$(EXE)
+
+# M0-verify: run the CUDA range-chaining identity oracle against a model
+# snapshot. BEGIN SPLIT END CONTEXT defaults to the full-range CPU chaining
+# oracle's shape (0 4 8 8); override for larger ranges.
+#   make segment-cuda-real CUDA=1 CUDA_ARCH=sm_60 \
+#     QWEN_SEGMENT_MODEL=/path/to/qwen36_i4_gs64
+segment-cuda-real: tests/test_segment_cuda_real$(EXE)
+	@test -n "$(QWEN_SEGMENT_MODEL)" || { echo "set QWEN_SEGMENT_MODEL" >&2; exit 2; }
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_cuda_real$(EXE) "$(QWEN_SEGMENT_MODEL)" 0 4 8 8
 
 .PHONY: edge-adapters edge-adapters-real
 edge-adapters: tests/test_edge_adapters_registration$(EXE)

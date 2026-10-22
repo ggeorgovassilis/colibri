@@ -3052,7 +3052,8 @@ static int gguf_report_unused(const Cfg *c) {
 
 static void model_init_range(Model *m, const char *snap, int cap, int bits,
                              int layer_begin, int layer_end,
-                             int load_boundaries, int allocate_state) {
+                             int load_boundaries, int allocate_state,
+                             int dense_i8) {
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
     if (g_gguf) {
@@ -3082,13 +3083,14 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     double t0 = now_s();
     qwen_dense_file_open(m, snap, load_boundaries && allocate_state && layer_begin == 0 && layer_end == c->n_layers);
     /* Quantize during load only for the full-model path (main()'s static Model,
-     * load_boundaries=1): the Segment/Edge adapters build partial or auxiliary
-     * models straight off this same loop and never ran the old post-hoc
-     * qdw_register pass either, so gating on load_boundaries keeps their
-     * f32-only numerics exactly as they were. */
+     * load_boundaries=1) or when the caller explicitly needs the dense int8
+     * rows (the CUDA segment's trunk-only chain: its kernels read w->q). The
+     * CPU Segment/Edge adapters build partial or auxiliary models straight off
+     * this same loop and never ran the old post-hoc qdw_register pass either,
+     * so keeping them f32-only preserves their numerics exactly. */
     /* GGUF: the dense matrices stay in the ggml type the file chose; a second
      * quantization to int8 is exactly what reading GGUF natively avoids. */
-    int quantize_dense = load_boundaries && dense_i8_on() && !g_gguf;
+    int quantize_dense = (load_boundaries || dense_i8) && dense_i8_on() && !g_gguf;
     int qcount = 0; double qfreed = 0;
     if (load_boundaries) {
         const gguf_tensor *et = g_gguf ? gg_tensor("model.embed_tokens.weight") : NULL;
@@ -3303,7 +3305,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
 }
 
 static void model_init(Model *m, const char *snap, int cap, int bits) {
-    model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
+    model_init_range(m, snap, cap, bits, 0, 0, 1, 1, 0);
 }
 
 /* scale counts per expert matrix: per-row (gs=0) or grouped along input dim */
@@ -8409,7 +8411,11 @@ int main(int argc, char **argv) {
 typedef struct {
     Model model;
     uint32_t layer_begin, layer_end, context_tokens;
+    int cuda;   /* this engine runs its range on a CUDA device (trunk-only dense chain) */
     pthread_mutex_t run_lock;
+#ifdef COLI_CUDA
+    Q36CChain *chain;
+#endif
 } Qwen36SegmentEngine;
 
 typedef struct {
@@ -8455,6 +8461,98 @@ static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
     st_destroy(&model->S);
 }
 
+#ifdef COLI_CUDA
+/* M0: trunk-only dense chain for a layer range on one device. The routed
+ * experts stay on the host -- expert_get loads them from the snapshot into
+ * the model's slot cache exactly as the CPU range path does -- while the
+ * dense trunk (attention / DeltaNet projections, norms, the gate router)
+ * runs on the device. Returns 1 when the chain came up, 0 when it declined
+ * (the engine then runs its range on the CPU, as before). */
+static int qwen36_segment_cuda_setup(Qwen36SegmentEngine *engine) {
+    Model *m = &engine->model;
+    Cfg *c = &m->c;
+    if (!q36cc_env_on()) {
+        fprintf(stderr, "[chain] qwen36 segment: COLI_CUDA_CHAIN=0; the range stays on the CPU\n");
+        return 0;
+    }
+    /* the chain needs every matrix on ONE device: pin the tier to device 0 */
+    if (!getenv("COLI_GPUS") && !getenv("COLI_GPU"))
+        setenv("COLI_GPUS", "0", 1);
+    if (!getenv("COLI_CUDA") || getenv("COLI_CUDA")[0] != '1')
+        setenv("COLI_CUDA", "1", 1);
+    /* offer the dense trunk before qt_init decides its budget */
+    int O_qkv = c->dn_conv_dim, O_z = c->dn_vheads * c->dn_vdim;
+    for (uint32_t i = engine->layer_begin; i < engine->layer_end; i++) {
+        if (c->is_attn[i]) continue;
+        if (m->L[i].dn_qkv.q && m->L[i].dn_z.q)
+            qt_trunk_offer("dnproj", (int)i,
+                           (size_t)(O_qkv + O_z) * c->hidden +
+                           (size_t)(O_qkv + O_z) * sizeof(float));
+    }
+    trunk_offer_dense(m);
+    /* trunk-only: the routed experts stay on the CPU (expert_is_int4 = -1) */
+    int cap = qwen36_resolved_cap(0, m->cache, c->n_layers);
+    if (!qt_init(c->n_layers, c->n_experts, c->hidden, c->inter, cap, c->topk,
+                 c->expert_gs, -1) && !qt_ready()) {
+        fprintf(stderr, "[chain] qwen36 segment: the CUDA tier did not start; the range stays on the CPU\n");
+        return 0;
+    }
+    atexit(qt_shutdown);
+    /* DeltaNet input projections (qkv ++ z fused into one resident tensor) */
+    for (uint32_t i = engine->layer_begin; i < engine->layer_end; i++) {
+        if (c->is_attn[i]) continue;
+        int dev = qt_place_of("dnproj", (int)i);
+        if (dev == QT_PLACE_CPU) continue;
+        const int8_t *q1 = m->L[i].dn_qkv.q, *q2 = m->L[i].dn_z.q;
+        const float *s1 = m->L[i].dn_qkv.sc, *s2 = m->L[i].dn_z.sc;
+        if (!q1 || !q2) continue;
+        int Of = O_qkv + O_z, Hd = c->hidden;
+        int8_t *qf = malloc((size_t)Of * Hd);
+        float *sf = malloc((size_t)Of * sizeof(float));
+        if (!qf || !sf) { free(qf); free(sf); break; }
+        memcpy(qf, q1, (size_t)O_qkv * Hd);
+        memcpy(qf + (size_t)O_qkv * Hd, q2, (size_t)O_z * Hd);
+        memcpy(sf, s1, (size_t)O_qkv * sizeof(float));
+        memcpy(sf + O_qkv, s2, (size_t)O_z * sizeof(float));
+        qt_dnproj_init((int)i, qf, sf, Hd, Of, dev);
+        free(qf); free(sf);
+    }
+    {   /* the rest of the trunk, wherever the placer put it (one device here) */
+        double vram = 0; int kinds[3];
+        int placed = trunk_place_dense(m, &vram, kinds);
+        if (placed)
+            fprintf(stderr, "[dense] qwen36 segment: %d trunk matrices on GPU (%d dnout, %d attnproj, %d shexp; %.2f GB VRAM)\n",
+                    placed, kinds[0], kinds[1], kinds[2], vram / 1073741824.0);
+    }
+    Q36CChain *chain = q36cc_setup_range(m, 1, (int)engine->layer_begin,
+                                         (int)engine->layer_end);
+    if (!chain) {
+        fprintf(stderr, "[chain] qwen36 segment: the range chain did not come up; the CPU path stands\n");
+        return 0;
+    }
+    g_cuda_chain = 1;
+    engine->chain = chain;
+    atexit(cc_shutdown);
+    return 1;
+}
+
+static void qwen36_segment_cuda_chain_free(Qwen36SegmentEngine *engine) {
+    Q36CChain *ch = engine->chain;
+    if (!ch) return;
+    q36cc_free_own(ch, &engine->model);   /* the chain's own device tensors + DeltaNet state + KV mirrors */
+    free(ch->host_routed);
+    free(ch->o_in); free(ch->o_post); free(ch->o_qn); free(ch->o_kn);
+    free(ch->o_conv); free(ch->o_dn); free(ch->t_ab); free(ch->t_sg);
+    free(ch->t_gate); free(ch->t_q); free(ch->t_k); free(ch->t_v);
+    free(ch->t_o); free(ch->t_dnp); free(ch->t_dno); free(ch->t_shg);
+    free(ch->t_shu); free(ch->t_shd); free(ch->rec); free(ch->ring);
+    free(ch->kc); free(ch->vc); free(ch->kv_valid); free(ch->attn_ord);
+    free(ch);
+    engine->chain = NULL;
+    engine->model.cchain = NULL;
+}
+#endif /* COLI_CUDA */
+
 static int qwen36_segment_engine_open(
     void **engine_impl, ColiSegmentCapabilities *capabilities,
     const ColiSegmentEngineOptions *options, char *error, size_t error_size) {
@@ -8463,9 +8561,15 @@ static int qwen36_segment_engine_open(
                                            "invalid Qwen3.6 Segment open");
     *engine_impl = NULL;
     if (options->backend_mask &&
-        (options->backend_mask & ~COLI_SEGMENT_CAP_CPU))
+        (options->backend_mask & ~(COLI_SEGMENT_CAP_CPU | COLI_SEGMENT_CAP_CUDA)))
         return coli_segment_adapter_error(error, error_size,
-                                           "Qwen3.6 Segment currently supports CPU");
+                                           "Qwen3.6 Segment backend not supported");
+    int cuda = (options->backend_mask & COLI_SEGMENT_CAP_CUDA) != 0;
+#ifndef COLI_CUDA
+    if (cuda)
+        return coli_segment_adapter_error(error, error_size,
+                                           "Qwen3.6 Segment built without a CUDA backend");
+#endif
     if (options->context_tokens > QWEN36_ATTN_MAX_CTX)
         return coli_segment_adapter_error(error, error_size,
                                            "Qwen3.6 Segment context exceeds model limit");
@@ -8503,6 +8607,7 @@ static int qwen36_segment_engine_open(
     engine->layer_begin = options->layer_begin;
     engine->layer_end = options->layer_end;
     engine->context_tokens = options->context_tokens;
+    engine->cuda = cuda;
     if (pthread_mutex_init(&engine->run_lock, NULL)) {
         free(config.is_attn); free(engine);
         return coli_segment_adapter_error(error, error_size,
@@ -8510,7 +8615,8 @@ static int qwen36_segment_engine_open(
     }
     free(config.is_attn);
     model_init_range(&engine->model, options->model_dir, cap, 8,
-                     (int)options->layer_begin, (int)options->layer_end, 0, 0);
+                     (int)options->layer_begin, (int)options->layer_end, 0, 0,
+                     cuda ? 1 : 0);
     engine->model.quant_bits = container_layer_is_int4(
         &engine->model, (int)options->layer_begin) ? 4 : 8;
     free(engine->model.DN_rec); free(engine->model.DN_conv); free(engine->model.dn_dev_fresh); free(engine->model.dn_host_stale);
@@ -8547,6 +8653,10 @@ static int qwen36_segment_engine_open(
                           COLI_SEGMENT_CAP_RANGE_NATIVE |
                           COLI_SEGMENT_CAP_MULTI_SESSION |
                           COLI_SEGMENT_CAP_CPU;
+    int cuda_chain_up = 0;
+#ifdef COLI_CUDA
+    if (cuda) cuda_chain_up = qwen36_segment_cuda_setup(engine);
+#endif
     coli_segment_capability_string(capabilities->engine_id,
                                    sizeof(capabilities->engine_id), "qwen36");
     coli_segment_capability_string(capabilities->state_schema,
@@ -8554,7 +8664,10 @@ static int qwen36_segment_engine_open(
                                    "qwen36/kv-deltanet-conv-f32-v1");
     snprintf(capabilities->numeric_class,
              sizeof(capabilities->numeric_class),
-             "qwen36/f32-int%d/cpu-v1", engine->model.quant_bits);
+             "qwen36/f32-int%d/%s-v1", engine->model.quant_bits,
+             cuda_chain_up ? "cuda" : "cpu");
+    if (cuda_chain_up)
+        capabilities->flags |= COLI_SEGMENT_CAP_CUDA;
     capabilities->state_dtype = COLI_SEGMENT_DTYPE_F32;
     capabilities->state_width = (uint32_t)engine->model.c.hidden;
     capabilities->max_batch_rows = 128;
@@ -8567,6 +8680,9 @@ static int qwen36_segment_engine_open(
 static void qwen36_segment_engine_destroy(void *engine_impl) {
     Qwen36SegmentEngine *engine = (Qwen36SegmentEngine *)engine_impl;
     if (!engine) return;
+#ifdef COLI_CUDA
+    qwen36_segment_cuda_chain_free(engine);
+#endif
     qwen36_segment_model_destroy(engine);
     pthread_mutex_destroy(&engine->run_lock);
     free(engine);
@@ -8667,9 +8783,43 @@ static int qwen36_segment_session_run(void *session_impl,
     model->DN_rec = session->DN_rec; model->DN_conv = session->DN_conv;
     model->max_t = (int)session->context_tokens;
     model->kv_len = (int)session->position;
-    layers_forward_range(model, (float *)request->output, (int)request->rows,
-                         (int)request->position, (int)engine->layer_begin,
-                         (int)engine->layer_end, 0, NULL);
+    int ran_cuda = 0;
+#ifdef COLI_CUDA
+    if (engine->chain) {
+        /* Segment sessions are isolated from one another: the device chain is
+         * only a scratch mirror of THIS session's host state. Force a full
+         * reload (DeltaNet + KV watermark) so a restored session (or a sibling
+         * session sharing this engine) never inherits leftover device state
+         * from another session's run. */
+        engine->chain->dn_where = Q36CC_HOST;
+        engine->chain->host_zero = 0;
+        for (int i = (int)engine->layer_begin; i < (int)engine->layer_end; i++)
+            if (engine->model.c.is_attn[i])
+                engine->chain->kv_valid[i] = 0;
+        int rows_only = 0;
+        int taken = q36cc_forward(model, (float *)request->output,
+                                  (int)request->rows, (int)request->position,
+                                  NULL, 1, 0, NULL, &rows_only);
+        if (taken) {
+            ran_cuda = 1;
+            /* the chain leaves the DeltaNet state on the device; pull it back
+             * so the host state (snapshot/restore, the CPU fallback) is current */
+            if (!q36cc_sync_one(model, engine->chain)) {
+                g_cuda_chain = 0;
+                fprintf(stderr, "[chain] qwen36 segment: lost the device's DeltaNet state; the CPU path stands\n");
+                layers_forward_range(model, (float *)request->output,
+                                     (int)request->rows, (int)request->position,
+                                     (int)engine->layer_begin,
+                                     (int)engine->layer_end, 0, NULL);
+                ran_cuda = 0;
+            }
+        }
+    }
+#endif
+    if (!ran_cuda)
+        layers_forward_range(model, (float *)request->output, (int)request->rows,
+                             (int)request->position, (int)engine->layer_begin,
+                             (int)engine->layer_end, 0, NULL);
     model->K = NULL; model->V = NULL;
     model->DN_rec = NULL; model->DN_conv = NULL;
     model->kv_len = 0;
