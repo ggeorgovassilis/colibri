@@ -819,6 +819,12 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
     if (!g_cuda_chain || qq_active() || g_pilot || m->mux_rows) return 0;
     Q36CChain *ch = q36cc_of(m);
     if (!ch || !ch->ok || ch->failed) return 0;
+    /* M3: pin THIS thread's device context before any cc_* call. cc_init is a
+     * no-op re-pin for an already-up context (each device's context is created
+     * once at setup), so a stage worker on its own thread selects its chain's
+     * device -- without it, a second chain on another device would run on
+     * whatever device this thread's (thread-local) g_cur happened to name. */
+    if (!cc_init(ch->dev)) return 0;
     Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, E = c->n_experts;
     int b = ch->layer_begin, e = ch->layer_end;
     int CH = q36cc_rows_max(ch, m), rows = S < CH ? S : CH;

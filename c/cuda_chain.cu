@@ -51,7 +51,15 @@ struct CcCtx {
     float *adec; size_t adec_bytes;   /* cc_attn_dec_k's blocks */
 };
 CcCtx g_cc[COLI_CUDA_MAX_DEVICES];
-int g_ncc, g_cur = -1;   /* g_cur: index into g_cc of the current context */
+int g_ncc;
+/* g_cur: index into g_cc of the current context. Per-thread (thread_local): two
+ * segment engines on two devices run their chains concurrently on two threads,
+ * and each thread must hold its OWN device context -- a shared g_cur would make
+ * one engine's cc_* calls land on the other's device. The CUDA runtime's current
+ * device is itself per-thread, so this mirrors backend_cuda.cu's g_current_device.
+ * g_cc[] and g_ncc are written only at setup (single-threaded); g_cur is the only
+ * per-forward mutation, so each thread keeps its own. */
+thread_local int g_cur = -1;
 CcStats g_st;
 
 double cc_now_ms(void) {
