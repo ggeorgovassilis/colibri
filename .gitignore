@@ -1,5 +1,6 @@
 # ambienti python / cache
 c/mio_env/
+.venv-tiny/
 __pycache__/
 **/__pycache__/
 *.pyc

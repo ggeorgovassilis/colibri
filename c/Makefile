@@ -2720,6 +2720,25 @@ tests/test_edge_adapters_real$(EXE): tests/test_edge_adapters_real.c \
 	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_edge_adapters_real.c \
 		edge_runtime.c segment_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
 
+# M1: in-process pipeline driver. Drives greedy decode through a 2-stage
+# Segment chain and checks it equals the full-range chain (and the oracle when
+# a reference JSON is supplied). CPU build for tiny fixtures.
+tests/test_pipeline_real$(EXE): tests/test_pipeline_real.c \
+		edge_runtime.c segment_runtime.c edge_runtime.h segment_runtime.h \
+		edge_adapters.h segment_adapters.h json.h $(SEGMENT_ALL_OBJS)
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_pipeline_real.c \
+		edge_runtime.c segment_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+
+# M1 CUDA build: the qwen36 engine object carries the CUDA-backed Segment range
+# and the Edge adapter, linked against the dense-chain tier and CUDA runtime.
+tests/test_pipeline_cuda_real$(EXE): \
+		tests/test_pipeline_real.c segment_runtime.c edge_runtime.c \
+		segment_runtime.h edge_runtime.h segment_adapters.h \
+		edge_adapters.h json.h $(SEGMENT_CUDA_QWEN36_OBJ) $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_pipeline_real.c \
+		segment_runtime.c edge_runtime.c $(SEGMENT_CUDA_QWEN36_OBJ) \
+		$(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(LDFLAGS)
+
 .PHONY: segment-adapters segment-adapters-real segment-cuda
 segment-adapters: tests/test_segment_adapters_registration$(EXE)
 	./tests/test_segment_adapters_registration$(EXE)
@@ -2788,6 +2807,29 @@ edge-adapters-real: tests/test_edge_adapters_real$(EXE)
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) qwen36 "$(QWEN_EDGE_MODEL)" "$(QWEN_EDGE_REF)" 3
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) qwen38 "$(QWEN38_EDGE_MODEL)" "$(QWEN38_EDGE_REF)" 3
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) deepseek_v4 "$(DEEPSEEK_EDGE_MODEL)" "$(DEEPSEEK_EDGE_REF)" 3
+
+# M1 pipeline driver, CPU (tiny fixture): 2-stage chain equals the full-range
+# chain and the generated oracle. Generate the fixture first with
+# `make qwen36-tiny-v128-generate`.
+.PHONY: pipeline-real
+pipeline-real: tests/test_pipeline_real$(EXE)
+	@test -f qwen36_tiny_v128/ref_full.json -a -d qwen36_tiny_v128_c || { \
+		echo "run 'make qwen36-tiny-v128-generate' first" >&2; exit 2; }
+	$(PYTHON) -c "import pathlib,sys; sys.path.insert(0,'tests'); \
+		from prefix_serve_harness import ensure_byte_tokenizer; \
+		ensure_byte_tokenizer(pathlib.Path('./qwen36_tiny_v128_c'), size=128)"
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_pipeline_real$(EXE) \
+		qwen36 ./qwen36_tiny_v128_c 4 3 ./qwen36_tiny_v128/ref_full.json
+
+# M1 pipeline driver, CUDA (real model on rig1): the qwen36 engine object is
+# CUDA-backed; both stages land on device 0 for the single-device driver proof.
+#   make pipeline-cuda-real CUDA=1 CUDA_ARCH=sm_60 \
+#     QWEN_PIPELINE_MODEL=/path/to/qwen36_i4_gs64
+.PHONY: pipeline-cuda-real
+pipeline-cuda-real: tests/test_pipeline_cuda_real$(EXE)
+	@test -n "$(QWEN_PIPELINE_MODEL)" || { echo "set QWEN_PIPELINE_MODEL" >&2; exit 2; }
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_pipeline_cuda_real$(EXE) \
+		qwen36 "$(QWEN_PIPELINE_MODEL)" 20 3
 
 V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
 V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
@@ -3409,7 +3451,7 @@ tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c tests
 # The same covers a .d deleted by hand.
 AUTODEP_ELSEWHERE = test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real test_deepseek_v4 \
-	test_v4_serve_framing
+	test_v4_serve_framing test_pipeline_real test_pipeline_cuda_real
 AUTODEP_OWN_FLAGS = bench_cuda_resident_batch bench_load_tq_peak_rss \
 	bench_indexer_allocations
 ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))
