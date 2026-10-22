@@ -2729,6 +2729,16 @@ tests/test_pipeline_real$(EXE): tests/test_pipeline_real.c \
 	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_pipeline_real.c \
 		edge_runtime.c segment_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
 
+# M1b: lock-step 2-stage x 2-batch overlap ring over the CPU Segment path.
+# Two independent decodes advance through the pipeline concurrently (stage-1
+# of one overlaps stage-0 of the other); tokens are checked against the serial
+# full-range decode and the oracle.
+tests/test_pipeline_overlap$(EXE): tests/test_pipeline_overlap.c \
+		edge_runtime.c segment_runtime.c edge_runtime.h segment_runtime.h \
+		edge_adapters.h segment_adapters.h json.h $(SEGMENT_ALL_OBJS)
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_pipeline_overlap.c \
+		edge_runtime.c segment_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+
 # M1 CUDA build: the qwen36 engine object carries the CUDA-backed Segment range
 # and the Edge adapter, linked against the dense-chain tier and CUDA runtime.
 tests/test_pipeline_cuda_real$(EXE): \
@@ -2819,6 +2829,20 @@ pipeline-real: tests/test_pipeline_real$(EXE)
 		from prefix_serve_harness import ensure_byte_tokenizer; \
 		ensure_byte_tokenizer(pathlib.Path('./qwen36_tiny_v128_c'), size=128)"
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_pipeline_real$(EXE) \
+		qwen36 ./qwen36_tiny_v128_c 4 3 ./qwen36_tiny_v128/ref_full.json
+
+# M1b pipeline overlap driver, CPU (tiny fixture): two concurrent decodes
+# through the 2-stage ring equal the serial full-range decode and the oracle,
+# and the two stages demonstrably overlap. Generate the fixture first with
+# `make qwen36-tiny-v128-generate`.
+.PHONY: pipeline-overlap
+pipeline-overlap: tests/test_pipeline_overlap$(EXE)
+	@test -f qwen36_tiny_v128/ref_full.json -a -d qwen36_tiny_v128_c || { \
+		echo "run 'make qwen36-tiny-v128-generate' first" >&2; exit 2; }
+	$(PYTHON) -c "import pathlib,sys; sys.path.insert(0,'tests'); \
+		from prefix_serve_harness import ensure_byte_tokenizer; \
+		ensure_byte_tokenizer(pathlib.Path('./qwen36_tiny_v128_c'), size=128)"
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_pipeline_overlap$(EXE) \
 		qwen36 ./qwen36_tiny_v128_c 4 3 ./qwen36_tiny_v128/ref_full.json
 
 # M1 pipeline driver, CUDA (real model on rig1): the qwen36 engine object is
