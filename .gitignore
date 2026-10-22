@@ -9,7 +9,7 @@ web/dist/
 web/*.tsbuildinfo
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
-
+tmp/
 # binari compilati (si rigenerano con make / coli build)
 c/colibri
 c/colibri.exe
