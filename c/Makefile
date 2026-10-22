@@ -2739,6 +2739,13 @@ tests/test_pipeline_overlap$(EXE): tests/test_pipeline_overlap.c \
 	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_pipeline_overlap.c \
 		edge_runtime.c segment_runtime.c $(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
 
+# M2 synthetic overlap proof: model-free micro-benchmark proving the 2-stage
+# ring overlaps (pipelined wall-clock < serial sum) and that the bubble ratio
+# improves over serialised execution. No model, GPU or fixture: CI-safe.
+tests/test_pipeline_synthetic$(EXE): tests/test_pipeline_synthetic.c
+	$(CC) $(SEGMENT_CPU_CFLAGS) tests/test_pipeline_synthetic.c \
+		-o $@ $(NOCUDA_LDFLAGS)
+
 # M1 CUDA build: the qwen36 engine object carries the CUDA-backed Segment range
 # and the Edge adapter, linked against the dense-chain tier and CUDA runtime.
 tests/test_pipeline_cuda_real$(EXE): \
@@ -2844,6 +2851,17 @@ pipeline-overlap: tests/test_pipeline_overlap$(EXE)
 		ensure_byte_tokenizer(pathlib.Path('./qwen36_tiny_v128_c'), size=128)"
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_pipeline_overlap$(EXE) \
 		qwen36 ./qwen36_tiny_v128_c 4 3 ./qwen36_tiny_v128/ref_full.json
+
+# M2 synthetic overlap proof: deterministic, model-free; pipelined wall-clock
+# must beat the serial sum by >= 15% and the bubble ratio must improve.
+.PHONY: pipeline-synthetic
+pipeline-synthetic: tests/test_pipeline_synthetic$(EXE)
+	./tests/test_pipeline_synthetic$(EXE)
+
+# M2 observability: the real overlap trace (timeline + bubble ratio) plus the
+# synthetic overlap proof. pipeline-overlap needs the tiny fixture.
+.PHONY: pipeline-observability
+pipeline-observability: pipeline-overlap pipeline-synthetic
 
 # M1 pipeline driver, CUDA (real model on rig1): the qwen36 engine object is
 # CUDA-backed; both stages land on device 0 for the single-device driver proof.
@@ -3475,7 +3493,8 @@ tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c tests
 # The same covers a .d deleted by hand.
 AUTODEP_ELSEWHERE = test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real test_deepseek_v4 \
-	test_v4_serve_framing test_pipeline_real test_pipeline_cuda_real
+	test_v4_serve_framing test_pipeline_real test_pipeline_cuda_real \
+	test_pipeline_overlap
 AUTODEP_OWN_FLAGS = bench_cuda_resident_batch bench_load_tq_peak_rss \
 	bench_indexer_allocations
 ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))

@@ -28,6 +28,10 @@
  * concurrency must reach two. Wall-clock timings are reported for
  * observability; throughput is not the point of this PoC.
  *
+ * M2 adds a timestamped timeline of every stage/driver slice and derives the
+ * pipeline bubble ratio from it (0 = packed, 0.5 = serialised), so the overlap
+ * is not only asserted but visible.
+ *
  * usage: test_pipeline_overlap FAMILY MODEL_DIR SPLIT MAX_NEW [REF_JSON]
  *   REF_JSON may be "-" to skip the oracle and drive two fixed text prompts.
  */
@@ -43,6 +47,14 @@ static double now_ms(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
+
+/* One timestamped activity in the pipeline timeline (M2 observability). */
+typedef struct {
+    int stage;   /* 0 or 1, or -1 for the driver's select/embed slice */
+    int req;     /* request index the activity belongs to */
+    double t0;   /* start, ms (monotonic) */
+    double t1;   /* end, ms (monotonic) */
+} TraceEvent;
 
 /* ---- reusable barrier (POSIX, portable across the supported hosts) ---- */
 
@@ -256,7 +268,53 @@ typedef struct {
     int failed;
     int in_flight;
     int max_in_flight;
+    /* M2 observability: timestamped timeline of every stage/driver slice. */
+    TraceEvent *trace;
+    int trace_cap;
+    int trace_count;
+    pthread_mutex_t trace_lock;
 } Ring;
+
+/* ---- M2 observability: timeline trace + bubble ratio ------------------ */
+
+static void trace_record(Ring *r, int stage, int req, double t0, double t1) {
+    pthread_mutex_lock(&r->trace_lock);
+    if (r->trace_count < r->trace_cap)
+        r->trace[r->trace_count++] = (TraceEvent){stage, req, t0, t1};
+    pthread_mutex_unlock(&r->trace_lock);
+}
+
+/* Print the recorded timeline and report the pipeline bubble ratio: the
+ * fraction of stage capacity idle across the run. 0 = perfectly packed,
+ * 0.5 = the two stages never overlapped (serialised). Lower is better. */
+static void trace_report(const Ring *r) {
+    if (r->trace_count < 1) return;
+    double tmin = r->trace[0].t0, tmax = r->trace[0].t1;
+    double busy[2] = {0.0, 0.0};
+    int runs[2] = {0, 0};
+    for (int i = 0; i < r->trace_count; i++) {
+        const TraceEvent *e = &r->trace[i];
+        if (e->t0 < tmin) tmin = e->t0;
+        if (e->t1 > tmax) tmax = e->t1;
+        if (e->stage >= 0) {
+            busy[e->stage] += e->t1 - e->t0;
+            runs[e->stage]++;
+        }
+    }
+    double makespan = tmax - tmin;
+    double bubble = makespan > 0.0
+        ? 1.0 - (busy[0] + busy[1]) / (2.0 * makespan) : 0.0;
+    printf("  timeline (stage, req, t0, t1 in ms):\n");
+    for (int i = 0; i < r->trace_count; i++) {
+        const TraceEvent *e = &r->trace[i];
+        const char *label = e->stage == 0 ? "S0" : e->stage == 1 ? "S1" : "DR";
+        printf("    %s R%d  %8.2f %8.2f\n",
+               label, e->req, e->t0 - tmin, e->t1 - tmin);
+    }
+    printf("  makespan %.2f ms | S0 busy %.2f (%d runs) | S1 busy %.2f (%d runs)"
+           " | bubble ratio %.1f%%\n",
+           makespan, busy[0], runs[0], busy[1], runs[1], bubble * 100.0);
+}
 
 /* ---- the two stage workers -------------------------------------------- */
 
@@ -273,8 +331,11 @@ static void *stage0_worker(void *arg) {
              * deterministically rather than depending on OS scheduling. */
             int expected = (r->s0_req >= 0) + (r->s1_req >= 0);
             while (inflight_load(&r->in_flight) < expected) sched_yield();
-            if (run_stage(q->s0, 1, q->pos, &q->token, 1, q->emb, q->inter,
-                          r->row_bytes, q->error, sizeof(q->error)) != 0) {
+            double t0 = now_ms();
+            int rc = run_stage(q->s0, 1, q->pos, &q->token, 1, q->emb, q->inter,
+                               r->row_bytes, q->error, sizeof(q->error));
+            trace_record(r, 0, r->s0_req, t0, now_ms());
+            if (rc != 0) {
                 r->failed = 1;
             } else {
                 q->inter_token = q->token;
@@ -300,9 +361,12 @@ static void *stage1_worker(void *arg) {
             inflight_peak(&r->max_in_flight, inflight_load(&r->in_flight));
             int expected = (r->s0_req >= 0) + (r->s1_req >= 0);
             while (inflight_load(&r->in_flight) < expected) sched_yield();
-            if (run_stage(q->s1, 1, q->inter_pos, &q->inter_token, 1,
-                          q->inter, q->out, r->row_bytes,
-                          q->error, sizeof(q->error)) != 0) {
+            double t0 = now_ms();
+            int rc = run_stage(q->s1, 1, q->inter_pos, &q->inter_token, 1,
+                               q->inter, q->out, r->row_bytes,
+                               q->error, sizeof(q->error));
+            trace_record(r, 1, r->s1_req, t0, now_ms());
+            if (rc != 0) {
                 r->failed = 1;
             }
             inflight_add(&r->in_flight, -1);
@@ -378,6 +442,7 @@ static int pipelined_decode(Ring *r, int max_new,
         if (r->s1_req >= 0 && !r->failed) {
             Request *q = r->req[r->s1_req];
             int32_t token = 0;
+            double dt0 = now_ms();
             if (select_token(r->edge, q->out, r->row_bytes, &token,
                              error, error_size) != 0) {
                 r->failed = 1;
@@ -388,6 +453,7 @@ static int pipelined_decode(Ring *r, int max_new,
                                  error, error_size) != 0)
                     r->failed = 1;
             }
+            trace_record(r, -1, r->s1_req, dt0, now_ms());
             q->inter_pending = 0;
         }
         tick++;
@@ -588,6 +654,10 @@ int main(int argc, char **argv) {
     ring.req[1] = b;
     ring.edge = edge;
     ring.row_bytes = row_bytes;
+    ring.trace_cap = 8 * max_new + 32;
+    ring.trace = calloc((size_t)ring.trace_cap, sizeof(*ring.trace));
+    REQUIRE(ring.trace != NULL, "out of memory for timeline trace");
+    pthread_mutex_init(&ring.trace_lock, NULL);
     barrier_init(&ring.barrier, 3);
 
     double t_pipe = now_ms();
@@ -608,6 +678,7 @@ int main(int argc, char **argv) {
     REQUIRE(ring.max_in_flight == 2,
             "the two stages never overlapped (max_in_flight != 2)");
 
+    trace_report(&ring);
     printf("%s edge -> 2-stage ring (2 requests x %d tokens) ok "
            "(split %d/%u%s): overlap peak %d, serial %.2f ms, "
            "pipelined %.2f ms\n",
@@ -621,6 +692,10 @@ fail:
     if (ring.barrier.nparties) { /* destroy only if initialized */
         pthread_mutex_destroy(&ring.barrier.mu);
         pthread_cond_destroy(&ring.barrier.cv);
+    }
+    if (ring.trace) {
+        pthread_mutex_destroy(&ring.trace_lock);
+        free(ring.trace);
     }
     free_request(b);
     free_request(a);
