@@ -513,6 +513,20 @@ void qt_trunk_offer(const char *component, int layer, size_t bytes){
     if(layer < 0 || layer >= QT_DN_MAX_LAYERS) return;
     snprintf(G_offer[G_offer_n].name, sizeof G_offer[0].name, "%s", component);
     G_offer[G_offer_n].layer = layer; G_offer[G_offer_n].bytes = bytes; G_offer[G_offer_n].dev = QT_PLACE_CPU;
+    /* A second segment engine in a pipeline offers its trunk after the first
+     * engine's qt_init already ran auto_place over the tier's singleton state
+     * (G.on); those layers were never seen by the placer, so their offers stay
+     * QT_PLACE_CPU and the range falls back to the CPU. Re-apply the same home
+     * rule auto_place would have used (QT_HOME=layer) so the late range lands
+     * on its own card: lm_head on the last layer's device, everything else on
+     * the layer's device. */
+    if(G.on && G_auto_on && G_home_layer && layer < G.nl){
+        int di = !strcmp(component, "lmhead")
+                   ? (int)G_layer_dev[G.nl - 1]
+                   : (int)G_layer_dev[layer];
+        G_offer[G_offer_n].dev = G.dev[di];
+        G_trunk_bytes[di] += bytes;
+    }
     G_offer_n++;
 }
 

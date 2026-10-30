@@ -2769,6 +2769,37 @@ tests/test_pipeline_cuda_overlap$(EXE): \
 		segment_runtime.c edge_runtime.c $(SEGMENT_CUDA_QWEN36_OBJ) \
 		$(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
+# M4: OpenAI-compatible mux server that runs the proven 2-stage Segment
+# pipeline. It speaks the serve_codec.h protocol (READY/CAPS/STAT, ACCEPT,
+# DATA, DONE, ERROR, STOP, CANCEL) so openai_server.py drives it unchanged;
+# two worker threads run stage-0 ([0, split)) and stage-1 ([split, n)) so
+# stage-1 of one request overlaps stage-0 of another. CPU build.
+#
+# Launch (CPU): SNAP=./qwen36_tiny_v128_c QT_LAYER_SPLIT=4 ./pipeline_serve
+pipeline_serve$(EXE): pipeline_serve.c edge_runtime.c segment_runtime.c \
+		edge_runtime.h segment_runtime.h edge_adapters.h segment_adapters.h \
+		serve_codec.h serve_poll.h qwen36_sample.h $(SEGMENT_ALL_OBJS)
+	$(CC) $(SEGMENT_CPU_CFLAGS) pipeline_serve.c edge_runtime.c segment_runtime.c \
+		$(SEGMENT_ALL_OBJS) -o $@ $(NOCUDA_LDFLAGS)
+
+# M4 CUDA build: same server, with the CUDA-backed qwen36 Segment range bound
+# to device 0/1 by the tier contract COLI_GPUS=0,1 QT_HOME=layer
+# QT_LAYER_SPLIT=<split>.
+#
+# Launch (rig1): COLI_GPUS=0,1 QT_HOME=layer QT_LAYER_SPLIT=20 \
+#   SNAP=/models/qwen36_i4_gs64 ./pipeline_serve_cuda
+pipeline_serve_cuda$(EXE): \
+		pipeline_serve.c segment_runtime.c edge_runtime.c \
+		segment_runtime.h edge_runtime.h segment_adapters.h edge_adapters.h \
+		serve_codec.h serve_poll.h qwen36_sample.h \
+		$(SEGMENT_CUDA_QWEN36_OBJ) $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
+	$(CC) $(SEGMENT_CPU_CFLAGS) pipeline_serve.c segment_runtime.c edge_runtime.c \
+		$(SEGMENT_CUDA_QWEN36_OBJ) $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(LDFLAGS)
+
+.PHONY: pipeline-serve pipeline-serve-cuda
+pipeline-serve: pipeline_serve$(EXE)
+pipeline-serve-cuda: pipeline_serve_cuda$(EXE)
+
 .PHONY: segment-adapters segment-adapters-real segment-cuda
 segment-adapters: tests/test_segment_adapters_registration$(EXE)
 	./tests/test_segment_adapters_registration$(EXE)
